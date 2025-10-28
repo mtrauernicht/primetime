@@ -27,7 +27,7 @@ suppressPackageStartupMessages({
 
 options(dplyr.width = Inf)
 
-if (!require("BCalm", quietly = TRUE)){
+if (!require(BCalm, quietly = TRUE)){
         cat("--------------------------- Installing BCalm\n\n")
         remotes::install_github("kircherlab/BCalm")
         suppressPackageStartupMessages(library(BCalm))
@@ -39,18 +39,17 @@ if (!require("BCalm", quietly = TRUE)){
 # Read arguments #########################################################################
 ##########################################################################################
 
-
 option_list <- list(
         make_option(c("-p", "--pdna"), type = "character", default = NULL, help = "Path to the pDNA counts file"),
         make_option(c("-c", "--cdna"), type = "character", default = NULL, help = "Path to the cDNA counts file"),
-        make_option(c("-d", "--design"), type = "character", default = NULL, help = "Path to the design file"),
         make_option(c("-o", "--output"), type = "character", default = NULL, help = "Path to the output directory"),
         make_option(c("-t", "--threads"), type = "integer", default = 1, help = "Number of threads to use"),
         make_option(c("-q", "--pval_threshold"), type = "numeric", default = 0.05, help = "P-value threshold for significance"),
         make_option(c("--contrast_condition"), type = "character", default = NULL, help = "Condition to contrast"),
         make_option(c("--reference_condition"), type = "character", default = NULL, help = "Condition to contrast"),
         make_option(c("--plot_output"), type = "character", default = NULL, help = "Path to the output directory for the plots"),
-        # flag to tell wheter to make a single model for all the TFs or not
+        make_option(c("--num_replicates_contrast"), type = "integer", default = 1, help = "Number of replicates for the contrast condition"),
+        make_option(c("--num_replicates_reference"), type = "integer", default = 1, help = "Number of replicates for the reference condition"),
         make_option(c("--single_model"), type = "logical", default = FALSE, help = "Whether to make a single model for all the TFs or not")
 )
 
@@ -63,12 +62,41 @@ opt <- parse_args(opt_parser)
 ##########################################################################################
 
 pdna <- read.table(opt$pdna, header = TRUE, sep = "\t")
-cdna <- read.table(opt$cdna, header = TRUE, sep = "\t")
-design_df <- read.table(opt$design, header=T)
+name_of_the_pdna_replicate <- colnames(pdna) %>% setdiff(c("barcode", "negative_control"))
+
 contrast_condition <- opt$contrast_condition
 reference_condition <- opt$reference_condition
+
+# Setup the replicates that are gonna be used here
+ref_replicates = paste0(reference_condition, "_", 1:opt$num_replicates_reference)
+contrast_replicates = paste0(contrast_condition, "_", 1:opt$num_replicates_contrast)
+
+cdna <- read.table(opt$cdna, header = TRUE, sep = "\t") %>%
+        select(
+                tf,
+                negative_control,
+                promoter,
+                barcode,
+                all_of(c(ref_replicates, contrast_replicates))
+        )
+
+# Now, biuld the design df, with columns: sample (conditions and pDNA), replicate (names ), pDNA (whether is pDNA or not) and treatment (condition name; None for pDNA)
+design_df <- data.frame(
+        replicate = c(ref_replicates, contrast_replicates),
+        treatment = c(
+                rep(reference_condition, length(ref_replicates)),
+                rep(contrast_condition, length(contrast_replicates))
+        ),
+        sample = c(
+                rep(reference_condition, length(ref_replicates)),
+                rep(contrast_condition, length(contrast_replicates))
+        )
+)
+
+output_pdf_name <- paste0(reference_condition, "_vs_", contrast_condition, ".pdf")
+output_txt_name <- paste0(reference_condition, "_vs_", contrast_condition, ".txt")
 p_threshold <- opt$pval_threshold
-name_of_the_pdna_replicate <- colnames(pdna) %>% setdiff(c("barcode", "negative_control"))
+
 df <-
         merge(pdna, cdna %>% select(-negative_control), by = "barcode") %>%
         group_by(tf) %>%
@@ -91,7 +119,6 @@ parsed_cdna <-
         # Transform back again to every column being a replicate, but now we have the Sample_RepID_bcID
         pivot_wider(names_from = replicate_id, values_from = count) %>%
         as.data.frame()
-
 
 annotation_df <-
         data.frame(
@@ -175,6 +202,12 @@ for (this_promoter in all_promoters) {
         rownames(this_pdna_matrix) = this_tmp_parsed_pdna$tf
         rownames(this_cdna_matrix) <- this_cdna$tf
 
+
+        print("this pDNA matrix")
+        print(head(this_pdna_matrix))
+        print("This cDNA matrix")
+        print(head(this_cdna_matrix))
+
         # ========================================================================================
         BcVariantMPRASet <- MPRASet(
                 DNA = this_pdna_matrix,
@@ -202,6 +235,9 @@ for (this_promoter in all_promoters) {
                         as.numeric(y[length(y) - 1])
                 }
         )
+
+        print("Design BCalm")
+        print(design_bcalm)
 
         mpralm_fit_var <- mpralm(
                 object = BcVariantMPRASet,
@@ -251,7 +287,7 @@ all_results <- all_results %>%
 ##########################################################################################
 p_threshold <- opt$pval_threshold
 message(paste0("==== Applying signifficance thresholds: fdr <= ", p_threshold, "\n"))
-pdf(file.path(opt$plot_output, "primetime_volcano.pdf"), width = 10, height = 10)
+pdf(file.path(opt$plot_output, "volcano_plots/", output_pdf_name), width = 10, height = 10)
 
 message("==== Writing BCalm results")
 message("Reference condition:", opt$reference_condition)
@@ -283,7 +319,7 @@ all_results %>%
 invisible(dev.off())
 
 # Plotting lollipop plot
-pdf(file.path(opt$plot_output, "primetime_lollipop.pdf"), width = 21, height = 7)
+pdf(file.path(opt$plot_output, "lollipop_plots/", output_pdf_name), width = 21, height = 7)
 
 all_results %>%
         filter(!grepl("RANDOM", tf)) %>%
@@ -336,4 +372,4 @@ invisible(dev.off())
 
 all_results %>%
         select(-AveExpr, -t, -adj.P.Val, -B) %>%
-        write.table(file.path(opt$plot_output, "primetime_results.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+        write.table(file.path(opt$plot_output, 'output_data', output_txt_name), sep = "\t", quote = FALSE, row.names = FALSE)

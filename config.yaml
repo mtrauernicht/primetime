@@ -12,6 +12,7 @@ INPUT_DATA:
     condition: DMSO
     fastq: 
       - test_data/U2OS_DMSO_1.fastq.gz
+      - test_data/U2OS_DMSO_3.fastq.gz
 
   U2OS_calcitriol:
     is_pdna: False
@@ -33,7 +34,7 @@ COMPARATIVE_ANALYSIS:
   CONTRAST_CONDITION: Calcitriol
 
 # =============================================================================
-OUTPUT_DIRECTORY: test_data_output_pDNA_v2
+OUTPUT_DIRECTORY: test_data_output_control_13
 
 
 # ==============================================================================
@@ -56,7 +57,7 @@ BARCODE_DOWNSTREAM_SEQUENCE: CATCGTCGCATCCAAGAGGCTAGCTAACTA
 MAX_MISMATCH_DOWNSTREAM_SEQ: 3
 
 # Path to the barcode annotation file
-BARCODE_ANNOTATION_FILE: misc/bc_annotation_prime_v2.csv
+BARCODE_ANNOTATION_FILE: misc/bc_annotation_prime_v1.csv
 
 # Path to expected pDNA counts, to compare with as a QC
 EXPECTED_PDNA_COUNTS: misc/expected_pDNA_counts.txt

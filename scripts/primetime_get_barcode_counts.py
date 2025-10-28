@@ -40,6 +40,9 @@ def parse_arguments():
     parser.add_argument(
         "--threads", type=int, default=20, help="Number of threads to use"
     )
+    parser.add_argument(
+        "--invalid_bc_file", type=str, help="Output file for invalid barcodes"
+    )
 
     return parser.parse_args()
 
@@ -62,6 +65,7 @@ def process_chunk(chunk, regex_pattern, bc_length):
     mismatched = 0
     total_reads = 0
     results = []
+    invalids = []
 
     for record in chunk:
         total_reads += 1
@@ -72,18 +76,21 @@ def process_chunk(chunk, regex_pattern, bc_length):
             continue
         end_bc = match.span()[0]
         barcode = seq[0:end_bc]
-        if (len(barcode) >= bc_length) and ("N" not in barcode):
-            results.append(barcode)
-            matched_and_valid += 1
-        else:
-            matched_but_invalid += 1
+        results.append(barcode)
+        matched_and_valid += 1
+        # if (len(barcode) >= bc_length) and ("N" not in barcode):
+        #     results.append(barcode)
+        #     matched_and_valid += 1
+        # else:
+        #     invalids.append(barcode)
+        #     matched_but_invalid += 1
 
-    return matched_and_valid, matched_but_invalid, mismatched, total_reads, results
+    return matched_and_valid, matched_but_invalid, mismatched, total_reads, results, invalids
 
 # ==============================================================================
 # Get barcode counts
 # ==============================================================================
-def get_barcode_counts(fastq, bc_length, bc_downstream_seq, max_mismatch, num_cores):
+def get_barcode_counts(fastq, bc_length, bc_downstream_seq, max_mismatch, num_cores, invalids_file):
     regex_pattern = build_regexp_pattern(bc_downstream_seq, max_mismatch)
     matched_but_invalid = 0
     matched_and_valid = 0
@@ -100,18 +107,23 @@ def get_barcode_counts(fastq, bc_length, bc_downstream_seq, max_mismatch, num_co
         futures = [executor.submit(process_chunk, chunk, regex_pattern, bc_length) for chunk in chunks]
         for future in as_completed(futures):
             try:
-                m_valid, m_invalid, mm, t_reads, res = future.result()
+                m_valid, m_invalid, mm, t_reads, res, invalids = future.result()
                 matched_and_valid += m_valid
                 matched_but_invalid += m_invalid
                 mismatched += mm
                 total_reads += t_reads
                 results.extend(res)
+                invalids.extend(invalids)
                 # sys.stdout.write(f"Processed chunk: {t_reads} reads\n")
             except Exception as e:
                 sys.stderr.write(f"Error processing chunk: {e}\n")
 
     for barcode in results:
         sys.stdout.write(barcode + "\n")
+
+    with open(invalids_file, "w") as f:
+        for barcode in invalids:
+            f.write(barcode + "\n")
 
     return matched_and_valid, matched_but_invalid, mismatched, total_reads
 
@@ -143,7 +155,12 @@ def main():
     args = parse_arguments()
     matched_and_valid, matched_but_invalid, mismatched, total_reads = (
         get_barcode_counts(
-            args.fastq, args.bc_length, args.bc_downstream_seq, args.max_mismatch, args.threads
+            args.fastq,
+            args.bc_length, 
+            args.bc_downstream_seq, 
+            args.max_mismatch, 
+            args.threads, 
+            args.invalid_bc_file,
         )
     )
     write_stats(matched_and_valid, matched_but_invalid, mismatched, total_reads)
