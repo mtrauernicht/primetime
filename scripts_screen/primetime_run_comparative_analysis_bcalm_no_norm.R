@@ -378,39 +378,6 @@ if (opt$split_by_promoter) {
 }
 
 
-# Correcting the activities by dividing by the median of the negative controls per promoter
-message("==== Correcting activities by negative controls median")
-# Get the median of the negative controls per condition and promoter
-tf_promoter_map <- df %>% distinct(tf, promoter)
-
-negative_control_medians <- all_results %>%
-  filter(grepl("RANDOM", tf)) %>%
-  left_join(tf_promoter_map, by = "tf") %>%
-  group_by(promoter) %>%
-  summarise(
-    median_reference = median(!!sym(reference_condition), na.rm = TRUE),
-    median_contrast  = median(!!sym(contrast_condition),  na.rm = TRUE),
-    .groups = "drop"
-  )
-
-all_results <- all_results %>%
-  left_join(tf_promoter_map, by = "tf") %>%                # add promoter column
-  left_join(negative_control_medians, by = "promoter") %>%
-  mutate(
-    !!reference_condition := !!sym(reference_condition) - coalesce(median_reference, 0),
-    !!contrast_condition := !!sym(contrast_condition) - coalesce(median_contrast, 0)
-  ) %>%
-  select(-median_reference, -median_contrast, -promoter)
-
-
-# Compute logFC again after correction
-all_results <- all_results %>%
-        mutate(
-                # first save the old logFC
-                old_logFC = logFC,
-                # then compute the new logFC
-                logFC = !!sym(contrast_condition) - !!sym(reference_condition)
-        )
 
 # Correcting the p-values for multiple testing
 message("==== Correcting p-values")
@@ -419,8 +386,8 @@ all_results <- all_results %>%
                 # adjust p-values
                 p_adjusted = p.adjust(P.Value, method = "BH"),
                 # define significance: original BCalm logFC should be in the correct direction, new logFC should have a certain magnitude
-                sig = ifelse(logFC > 0.263 & old_logFC > 0 & p_adjusted <= p_threshold, "Upregulated",
-                        ifelse(logFC < -0.263 & old_logFC < 0 & p_adjusted <= p_threshold, "Downregulated",
+                sig = ifelse(logFC > 0  & p_adjusted <= p_threshold, "Upregulated",
+                        ifelse(logFC < 0 & p_adjusted <= p_threshold, "Downregulated",
                                 "NS"
                         )
                 )

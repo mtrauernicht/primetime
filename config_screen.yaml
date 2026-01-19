@@ -1,0 +1,49 @@
+################################################################################
+# Primetime: TF reporter pipeline
+# Vinícius H. Franceschini-Santos, Max Trauernicht 
+# ==============================================================================
+# ============================ Config file  ====================================
+# ==============================================================================
+
+#===============================================================================
+# ============================= Input and Output ===============================
+## Which plates should be processed?
+PLATES_FILE: /DATA/pipelines/primetime/testing_E2904/mt20260112_plates_to_file.txt
+## Which samples (wells) should be processed?
+SAMPLES_FILE: /DATA/pipelines/primetime/testing_E2904/E2904_well_specification.csv
+FILES_DIRECTORY: /shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files
+DEMULTIPLEX_DIRECTORY: /shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files/demultiplex
+## Which comparisons should be performed?
+COMPARISONS_FILE: /DATA/pipelines/primetime/testing_E2904/mt20260112_comparisons.txt
+## Where should the output be saved?
+OUTPUT_DIRECTORY: /DATA/pipelines/primetime/testing_E2904/001_OUTPUT_screen_testing
+      
+# ==============================================================================
+# ============================ Pipeline parameters =============================
+PVALUE_THRESHOLD: 0.01
+
+SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER: False
+
+# ==============================================================================
+# ============================ Library parameters ==============================
+# Number of barcodes per TF
+BARCODES_PER_TF: 5
+
+# Length of the barcodes
+BARCODE_LENGTH: 12
+
+# BC downstream sequence: this will be used to identify the barcodes in the fastq files
+BARCODE_DOWNSTREAM_SEQUENCE: CATCGTCGCATCCAAGAGGCTAGCTAACTA
+RT_BARCODE_UPSTREAM_SEQUENCE: CGTGCTAAGGCTTGACGCGAATCGAGCC
+
+# How many mismatches are allowed in the downstream sequence to identify the barcode?
+MAX_MISMATCH_DOWNSTREAM_SEQ: 3
+
+# Path to the barcode annotation file
+BARCODE_ANNOTATION_FILE: /DATA/pipelines/primetime/misc/bc_annotation_prime_v2.csv
+
+# Path to expected pDNA counts, to compare with as a QC
+EXPECTED_PDNA_COUNTS: /DATA/pipelines/primetime/misc/expected_pDNA_counts.txt
+
+# Path to RT barcode to well mapping file
+RT_BARCODE_MAPPING_FILE: /DATA/pipelines/primetime/misc/rt_barcode.csv

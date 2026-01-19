@@ -349,7 +349,7 @@ rule run_comparative_analysis:
         plots=os.path.join(output_dir, "primetime_results/volcano_plots/{ref}_vs_{contrast}.pdf"),
         loli=os.path.join(output_dir, "primetime_results/lollipop_plots/{ref}_vs_{contrast}.pdf"),
     params:
-        script=os.path.join(scripts_dir, "primetime_run_comparative_analysis_bcalm.R"),
+        script=os.path.join(base_dir, "scripts_screen", "primetime_run_comparative_analysis_bcalm.R"),
         out_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
         pval_threshold=config["PVALUE_THRESHOLD"],
         plot_output_dir=os.path.join(output_dir, "primetime_results"),
