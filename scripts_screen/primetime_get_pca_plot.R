@@ -12,12 +12,17 @@ suppressPackageStartupMessages({
   library(data.table)
   library(ggplot2)
   library(ggrepel)
+  library(RColorBrewer)
 })
 
 # Parse arguments
 option_list <- list(
   make_option(c("--results"), type="character", 
               help="Comma-separated list of comparison result files"),
+  make_option(c("--results-file"), type="character", dest="results_file",
+              help="Path to file with newline-separated comparison result files"),
+  make_option(c("--bleedthrough"), type="character",
+              help="Path to bleedthrough data file"),
   make_option(c("--output"), type="character", 
               help="Output PDF path for PCA plot")
 )
@@ -25,7 +30,7 @@ option_list <- list(
 opt_parser <- OptionParser(option_list=option_list)
 opt <- parse_args(opt_parser)
 
-if (is.null(opt$results) || is.null(opt$output)) {
+if ((is.null(opt$results) && is.null(opt$results_file)) || is.null(opt$output)) {
   print_help(opt_parser)
   stop("Missing required arguments")
 }
@@ -59,8 +64,20 @@ write_placeholder_pdf <- function(path, message_line) {
   cat(message_line, "\n")
 }
 
-# Parse input files
-result_files <- unlist(strsplit(opt$results, ","))
+# Parse input files (allow either comma-separated arg or newline-separated file)
+result_files <- character(0)
+if (!is.null(opt$results)) {
+  result_files <- c(result_files, unlist(strsplit(opt$results, ",")))
+}
+if (!is.null(opt$results_file)) {
+  if (!file.exists(opt$results_file)) {
+    stop("Results list file not found: ", opt$results_file)
+  }
+  listed <- trimws(readLines(opt$results_file, warn = FALSE))
+  listed <- listed[listed != ""]
+  result_files <- c(result_files, listed)
+}
+result_files <- unique(result_files)
 
 # Read and merge all comparison data
 all_data <- list()
@@ -83,16 +100,10 @@ for (file in result_files) {
     ref <- parts[1]
     contrast <- parts[2]
     
-    # Extract TF activity columns (assume corrected_activity columns exist)
-    activity_cols <- grep("corrected_activity", names(dt), value=TRUE)
-    
-    if (length(activity_cols) >= 2 && "tf" %in% names(dt)) {
-      # Assume first is reference, second is contrast
-      ref_col <- activity_cols[1]
-      contrast_col <- activity_cols[2]
-      
-      ref_vals <- suppressWarnings(as.numeric(dt[[ref_col]]))
-      contrast_vals <- suppressWarnings(as.numeric(dt[[contrast_col]]))
+    # Check if the condition columns exist in the data
+    if (ref %in% names(dt) && contrast %in% names(dt) && "tf" %in% names(dt)) {
+      ref_vals <- suppressWarnings(as.numeric(dt[[ref]]))
+      contrast_vals <- suppressWarnings(as.numeric(dt[[contrast]]))
       
       if (all(is.na(ref_vals)) || all(is.na(contrast_vals))) {
         next
@@ -171,9 +182,41 @@ pca_result <- tryCatch({
 pca_scores <- as.data.table(pca_result$x[, 1:2])
 pca_scores$condition <- rownames(pca_result$x)
 
-# Add color indicator for reference vs contrast
-pca_scores$type <- ifelse(pca_scores$condition %in% unique_references, 
-                           "Reference", "Contrast")
+# Add bleedthrough status to PCA scores
+if (!is.null(opt$bleedthrough) && !is.na(opt$bleedthrough) && file.exists(opt$bleedthrough)) {
+  bleedthrough_df <- fread(opt$bleedthrough)
+  message("Loaded bleedthrough data with ", nrow(bleedthrough_df), " rows")
+  
+  # For each condition, determine bleedthrough status
+  pca_scores$bleedthrough_status <- sapply(pca_scores$condition, function(cond) {
+    bleed_val <- bleedthrough_df$bleedthrough[bleedthrough_df$condition == cond]
+    if (length(bleed_val) > 0) {
+      max_bleed <- max(bleed_val, na.rm = TRUE)
+      if (max_bleed > 0.2) {
+        return("High")
+      } else if (max_bleed > 0.1) {
+        return("Medium")
+      } else {
+        return("Low")
+      }
+    } else {
+      return("Unknown")
+    }
+  })
+  pca_scores$bleedthrough_status <- factor(pca_scores$bleedthrough_status,
+                                            levels = c("Low", "Medium", "High", "Unknown"))
+  message("Bleedthrough status: Low=", sum(pca_scores$bleedthrough_status == "Low"),
+          ", Medium=", sum(pca_scores$bleedthrough_status == "Medium"),
+          ", High=", sum(pca_scores$bleedthrough_status == "High"),
+          ", Unknown=", sum(pca_scores$bleedthrough_status == "Unknown"))
+} else {
+  message("No bleedthrough data provided - using reference vs contrast coloring")
+  # Default to reference vs contrast if no bleedthrough data
+  pca_scores$bleedthrough_status <- factor(
+    ifelse(pca_scores$condition %in% unique_references, "Reference", "Contrast"),
+    levels = c("Reference", "Contrast")
+  )
+}
 
 # Calculate spread from centroid
 centroid <- c(mean(pca_scores$PC1), mean(pca_scores$PC2))
@@ -191,10 +234,50 @@ var_explained <- summary(pca_result)$importance[2, ]
 pc1_var <- round(var_explained[1] * 100, 1)
 pc2_var <- round(var_explained[2] * 100, 1)
 
+# Extract and analyze loadings (contributions of each TF to each PC)
+loadings_matrix <- pca_result$rotation[, 1:2]
+loadings_dt <- as.data.table(loadings_matrix, keep.rownames = "tf")
+setnames(loadings_dt, "PC1", "loading_PC1")
+setnames(loadings_dt, "PC2", "loading_PC2")
+
+# Add absolute values for ranking
+loadings_dt[, abs_loading_PC1 := abs(loading_PC1)]
+loadings_dt[, abs_loading_PC2 := abs(loading_PC2)]
+
+# Get top 5 TFs for each PC
+top_n <- 5
+top_pc1 <- loadings_dt[order(-abs_loading_PC1)][1:top_n]
+top_pc2 <- loadings_dt[order(-abs_loading_PC2)][1:top_n]
+
+cat("\n==== PC1 Analysis (", pc1_var, "% variance) ====\n", sep="")
+cat("Top ", top_n, " TFs influencing PC1:\n", sep="")
+for (i in seq_len(nrow(top_pc1))) {
+  direction <- if (top_pc1$loading_PC1[i] > 0) "positive" else "negative"
+  cat(sprintf("  %d. %s: %.4f (%s)\n", i, top_pc1$tf[i], top_pc1$loading_PC1[i], direction))
+}
+
+cat("\n==== PC2 Analysis (", pc2_var, "% variance) ====\n", sep="")
+cat("Top ", top_n, " TFs influencing PC2:\n", sep="")
+for (i in seq_len(nrow(top_pc2))) {
+  direction <- if (top_pc2$loading_PC2[i] > 0) "positive" else "negative"
+  cat(sprintf("  %d. %s: %.4f (%s)\n", i, top_pc2$tf[i], top_pc2$loading_PC2[i], direction))
+}
+
+# Define colors (same as bleedthrough plots and heatmap)
+corColors <- brewer.pal(n = 7, name = "RdYlBu")[2:6]
+bleedthrough_colors <- c(
+  "Low" = corColors[5],      # Blue (low bleedthrough, good)
+  "Medium" = corColors[2],   # Yellowish (medium bleedthrough, caution)
+  "High" = corColors[1],     # Orange/Red (high bleedthrough, bad)
+  "Unknown" = "grey80",
+  "Reference" = "red",       # Fallback if no bleedthrough data
+  "Contrast" = "steelblue"   # Fallback if no bleedthrough data
+)
+
 # Create PCA plot
-p <- ggplot(pca_scores, aes(x=PC1, y=PC2, color=type, label=label)) +
+p <- ggplot(pca_scores, aes(x=PC1, y=PC2, color=bleedthrough_status, label=label)) +
   geom_point(size=3, alpha=0.7) +
-  scale_color_manual(values=c("Reference"="red", "Contrast"="steelblue")) +
+  scale_color_manual(values=bleedthrough_colors, name="Bleedthrough") +
   geom_text_repel(
     data=subset(pca_scores, label != ""),
     size=3,
@@ -205,19 +288,47 @@ p <- ggplot(pca_scores, aes(x=PC1, y=PC2, color=type, label=label)) +
   labs(
     title="PCA of TF Activities Across Conditions",
     x=paste0("PC1 (", pc1_var, "% variance)"),
-    y=paste0("PC2 (", pc2_var, "% variance)"),
-    color="Condition Type"
+    y=paste0("PC2 (", pc2_var, "% variance)")
   ) +
+  coord_fixed() +
   theme_bw() +
   theme(
     legend.position="bottom",
     plot.title=element_text(hjust=0.5, face="bold")
   )
 
-# Save plot
-ggsave(opt$output, p, width=10, height=8)
+# Create loadings plot for PC1
+p_pc1_loadings <- ggplot(top_pc1, aes(x=reorder(tf, loading_PC1), y=loading_PC1, fill=loading_PC1)) +
+  geom_col() +
+  scale_fill_gradient2(low="#1e3a8a", mid="white", high="#c0392b", midpoint=0) +
+  coord_flip() +
+  labs(title=paste0("Top TFs driving PC1 (", pc1_var, "% variance)"),
+       x="TF", y="Loading") +
+  theme_bw() +
+  theme(legend.position="none", axis.title.y=element_blank())
+
+# Create loadings plot for PC2
+p_pc2_loadings <- ggplot(top_pc2, aes(x=reorder(tf, loading_PC2), y=loading_PC2, fill=loading_PC2)) +
+  geom_col() +
+  scale_fill_gradient2(low="#1e3a8a", mid="white", high="#c0392b", midpoint=0) +
+  coord_flip() +
+  labs(title=paste0("Top TFs driving PC2 (", pc2_var, "% variance)"),
+       x="TF", y="Loading") +
+  theme_bw() +
+  theme(legend.position="none", axis.title.y=element_blank())
+
+# Combine plots (PCA in center, loadings on sides)
+library(patchwork)
+p_combined <- p + (p_pc1_loadings / p_pc2_loadings) + plot_layout(widths=c(2, 1))
+
+# Save combined plot
+ggsave(opt$output, p_combined, width=14, height=8)
 
 cat("PCA plot saved to:", opt$output, "\n")
 cat("Total conditions:", nrow(pca_scores), "\n")
-cat("Reference conditions:", sum(pca_scores$type == "Reference"), "\n")
-cat("Contrast conditions:", sum(pca_scores$type == "Contrast"), "\n")
+if ("bleedthrough_status" %in% names(pca_scores) && is.factor(pca_scores$bleedthrough_status)) {
+  cat("Low bleedthrough:", sum(pca_scores$bleedthrough_status == "Low", na.rm=TRUE), "\n")
+  cat("Medium bleedthrough:", sum(pca_scores$bleedthrough_status == "Medium", na.rm=TRUE), "\n")
+  cat("High bleedthrough:", sum(pca_scores$bleedthrough_status == "High", na.rm=TRUE), "\n")
+  cat("Unknown bleedthrough:", sum(pca_scores$bleedthrough_status == "Unknown", na.rm=TRUE), "\n")
+}

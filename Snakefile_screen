@@ -134,15 +134,18 @@ plate_ids_to_use = list(plate_to_file.keys())
 # Add a third column (index 2) with the fastq file path for each well ID in column 0
 # files will be named like: files_dir/demultiplex_<plate_id>_<well>.fastq.gz
 rows = []
+pdna_added = False
 for _, row in df.iterrows():
     well = row.iloc[0]
     sample = row.iloc[1]
     for plate_id in plate_ids_to_use:
         # Special-case: pDNA is a single file (no well). The plates file contains the read1 path for pDNA
         if plate_id == "pDNA":
-            path = plate_to_file.get("pDNA")
-            # sample name for pDNA is 'pDNA' and well is left empty
-            rows.append([None, "pDNA", path])
+            if not pdna_added:
+                path = plate_to_file.get("pDNA")
+                # sample name for pDNA is 'pDNA' and well is left empty
+                rows.append([None, "pDNA", path])
+                pdna_added = True
         else:
             path = os.path.join(demultiplex_dir, f"{plate_id}_{sample}.fastq.gz")
             rows.append([well, sample, path])
@@ -164,12 +167,23 @@ for _, row in df.iterrows():
     # sample name is in column 1, fastq path in column 2
     sample = str(row.iloc[1])
     fastq = row.iloc[2]
-    if sample not in sample_replicate_files:
-        sample_replicate_files[sample] = {'1': fastq}
+    well = row.iloc[0]  # well ID from column 0
+    # For multi-plate experiments, we need to track samples by well_replicate (e.g., DMSO_1 from plate rep1 vs rep2)
+    # Create a key that includes well number for non-pDNA samples
+    if sample == "pDNA":
+        # pDNA has no well, just use sample name
+        sample_key = sample
     else:
-        # Get the replicate number based on how many files of this sample are there
-        replicate = str(len(sample_replicate_files[sample]) + 1)
-        sample_replicate_files[sample][replicate] = fastq
+        # Extract well number from sample name (e.g., "DMSO_1" -> "1", "minRT_10" -> "10")
+        # Sample names should be like "DMSO_1", "DMSO_2", "minRT_1", etc.
+        sample_key = sample
+    # Now assign replicate based on how many FASTQ files this sample_key has
+    if sample_key not in sample_replicate_files:
+        sample_replicate_files[sample_key] = {'1': fastq}
+    else:
+        # Get the replicate number based on how many files of this sample_key are there
+        replicate = str(len(sample_replicate_files[sample_key]) + 1)
+        sample_replicate_files[sample_key][replicate] = fastq
 
 
 # Parse all the comparisons in the comparisons file
@@ -203,6 +217,7 @@ rule all:
         qc=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
         heatmap_comparisons=os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
         pca_plot=os.path.join(output_dir, "primetime_results/pca_conditions.pdf"),
+        tf_specific_plots=os.path.join(output_dir, "primetime_results/tf_specific_plots"),
         all_comparisons=[
             os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
             for ref, contrasts in comparisons_dict.items()
@@ -411,6 +426,9 @@ rule get_activity_and_qc_plots:
         bleedthrough=os.path.join(
             output_dir, "primetime_QC/bleedthrough_estimation.pdf"
         ),
+        bleedthrough_data=os.path.join(
+            output_dir, "tmp_primetime/activity/bleedthrough_per_condition.txt"
+        ),
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
     params:
@@ -578,23 +596,20 @@ rule get_heatmap_of_conditions:
             os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
-        )
+        ),
+        bleedthrough=os.path.join(output_dir, "tmp_primetime/activity/bleedthrough_per_condition.txt")
     output:
         os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
     params:
-        script=os.path.join(scripts_dir, "primetime_get_heatmap_of_conditions.R"),
+        r_script=os.path.join(scripts_dir, "primetime_get_heatmap_of_conditions.R"),
     conda:
         os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
         """
-        if [ $(echo {input.results} | wc -w) -le 1 ]; then
-            echo "Not enough input files for heatmap, skipping."; touch {output};
-        else
-            results=$(echo {input.results} | tr ' ' ',')
-            Rscript {params.script} \
-            --results $results \
-            --output {output} > /dev/null 2>&1
-        fi
+        FILELIST=$(mktemp)
+        printf '%s\n' {input.results} > "$FILELIST"
+        Rscript {params.r_script} --results-file "$FILELIST" --bleedthrough {input.bleedthrough} --output {output}
+        rm "$FILELIST"
         """
 
 ##########################################################################################
@@ -605,21 +620,51 @@ rule get_pca_plot:
             os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
-        )
+        ),
+        bleedthrough=os.path.join(output_dir, "tmp_primetime/activity/bleedthrough_per_condition.txt")
     output:
         os.path.join(output_dir, "primetime_results/pca_conditions.pdf"),
     params:
-        script=os.path.join(scripts_dir, "primetime_get_pca_plot.R"),
+        r_script=os.path.join(scripts_dir, "primetime_get_pca_plot.R"),
     conda:
         os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
         """
-        if [ $(echo {input.results} | wc -w) -le 1 ]; then
-            echo "Not enough input files for PCA, skipping."; touch {output};
-        else
-            results=$(echo {input.results} | tr ' ' ',')
-            Rscript {params.script} \
-            --results $results \
-            --output {output}
-        fi
+        FILELIST=$(mktemp)
+        printf '%s\n' {input.results} > "$FILELIST"
+        Rscript {params.r_script} --results-file "$FILELIST" --bleedthrough {input.bleedthrough} --output {output}
+        rm "$FILELIST"
+        """
+
+##########################################################################################
+# 9) Get TF-specific plots (per-TF overview and lollipop plots)
+rule get_tf_specific_plots:
+    input:
+        results=expand(
+            os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        ),
+        barcode_dir=os.path.join(output_dir, "tmp_primetime/bc_counts"),
+        well_map=config['SAMPLES_FILE'],
+    output:
+        directory(os.path.join(output_dir, "primetime_results/tf_specific_plots"))
+    params:
+        r_script=os.path.join(scripts_dir, "primetime_get_tf_specific_plots.R"),
+    conda:
+        os.path.join(conda_envs_dir, "r_plotting.yaml")
+    shell:
+        """
+        mkdir -p {output}
+        
+        FILELIST=$(mktemp)
+        printf '%s\n' {input.results} > "$FILELIST"
+        
+        Rscript {params.r_script} \
+            --results-file "$FILELIST" \
+            --barcode-dir {input.barcode_dir} \
+            --well-map {input.well_map} \
+            --output-dir {output}
+        
+        rm "$FILELIST"
         """

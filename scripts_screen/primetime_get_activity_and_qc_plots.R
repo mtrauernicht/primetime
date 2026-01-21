@@ -176,8 +176,10 @@ pDNA <- counts_df %>%
     mutate_all(~ ifelse(is.na(.), 1, .)) %>%
     select(-replicate) %>%
     ##### VF250404: TAKE THE MEAN OF THE pDNA REPLICATES ## NOW DEALS WITH MORE THAN 1 pDNA rep
-    group_by(barcode) %>%
-    summarise(pDNA = mean(pDNA))
+    rowwise() %>%
+    mutate(pDNA = mean(c_across(-barcode))) %>%
+    ungroup() %>%
+    select(barcode, pDNA)
 
 # print('Check if any NA in pDNA')
 # pDNA %>%
@@ -304,6 +306,23 @@ bleed_through_slope_df <-
     filter(negative_control)
 
 
+
+message("==== Saving bleedthrough data")
+# Save bleedthrough slope data per condition for later use
+# Remove replicate suffix (_1, _2, etc.) from sample names to match comparison format
+bleedthrough_summary <- bleed_through_slope_df %>%
+    select(sample, slope) %>%
+    distinct() %>%
+    mutate(condition = sub("_\\d+$", "", sample)) %>%
+    select(condition, bleedthrough = slope)
+
+write.table(
+    bleedthrough_summary,
+    file.path(opt$activity_basedir, "bleedthrough_per_condition.txt"),
+    sep = "\t",
+    row.names = FALSE,
+    quote = FALSE
+)
 
 message("==== Plotting distribution of BC counts")
 
