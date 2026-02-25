@@ -1,0 +1,672 @@
+import sys
+import inspect
+import os
+import re
+import glob
+import pandas as pd
+
+__version__ = "1.0.0"
+##########################################################################################
+# primetime: TF reporter pipeline ########################################################
+# ########################################################################################
+# Description:
+#
+# This pipeline performs comprehensive analysis of TF prime reporter data,
+# supporting multiple comparisons across diverse experimental designs, including 
+# 96-well plates, drug screens, and large-scale studies.
+# It processes fastq files, counts barcodes, clusters them, annotates them, and 
+# performs differential TF activity analysis for all specified condition contrasts.
+#
+# Functionality:
+#
+# The pipeline is divided into the following steps:
+# 1) Get barcode counts
+#   - Counts the number of times each barcode appears in fastq files, using a
+#     constant downstream sequence and allowing a configurable number of mismatches.
+# 2) Cluster barcodes
+#   - Clusters barcodes based on a distance of 1 to account for sequencing errors.
+# 3) Annotate the barcodes
+#   - Annotates barcodes using a provided reference file containing barcode information.
+# 4) Get activity and QC plots
+#   - Calculates TF activity and generates QC plots after annotation.
+# 5) Run comparative analysis
+#   - Performs differential TF activity analysis using the BCalm package, 
+#     automatically handling all specified condition comparisons, including 
+#     high-throughput formats like 96-well plates and drug screens.
+# 6) Save final results
+#   - Outputs comprehensive results for each comparison, including corrected 
+#     activity and p-values for differential activity.
+#
+
+##########################################################################################
+# Preamble functions #####################################################################
+##########################################################################################
+
+# Setting up directories and paths
+filename = inspect.getframeinfo(inspect.currentframe()).filename
+base_dir = os.path.dirname(os.path.abspath(filename))
+scripts_dir = os.path.join(base_dir, "scripts_screen_bc_comb")
+conda_envs_dir = os.path.join(base_dir, "conda_envs")
+output_dir = config["OUTPUT_DIRECTORY"]
+comparisons_file = config['COMPARISONS_FILE']
+plates_file = config['PLATES_FILE']
+files_dir = config['FILES_DIRECTORY']
+samples_file = config['SAMPLES_FILE']
+demultiplex_dir = config['DEMULTIPLEX_DIRECTORY']
+
+
+# Goodbye message
+
+def format_config(key, value, space=0):
+    """
+    Helper function to format the config file in a nice way for the message
+    """
+    lines = []
+    # Check if value is a dictionary
+    if isinstance(value, dict):
+        lines.append(f"{' ' * space}\033[1m{key}:\033[0m")
+        for k, v in value.items():
+            if isinstance(v, dict):
+                lines.extend(format_config(k, v, space + 2))
+            else:
+                if isinstance(v, list):
+                    lines.append(f"{' ' * space} - \033[1m{k}:\033[0m")
+                    for i in v:
+                        # Escape curly braces for Snakemake message formatting
+                        escaped_i = str(i).replace("{", "{{").replace("}", "}}")
+                        lines.append(f"{'   ' * space}{escaped_i}")
+                else:
+                    # Escape curly braces for Snakemake message formatting
+                    escaped_v = str(v).replace("{", "{{").replace("}", "}}")
+                    lines.append(f"{' ' * space} - \033[1m{k}:\033[0m {escaped_v}")
+    else:
+        # Escape curly braces for Snakemake message formatting
+        escaped_value = str(value).replace("{", "{{").replace("}", "}}")
+        lines.append(f"\033[1m{key}:\033[0m {escaped_value}")
+    return lines
+
+
+def create_goodbye_message(sample_replicate_files, comparisons_dict):
+    """
+    Create a formatted goodbye message with pipeline info and config
+    """
+    lines = []
+    lines.append("\n"+"\033[0m=" * 80)
+    lines.append("primetime")
+    lines.append(f"Version {__version__}")
+    lines.append("-" * 80)
+    
+    for key, value in config.items():
+        lines.extend(format_config(key, value))
+    
+    # Show all the samples that were found
+    lines.append("\033[1mSAMPLES:\033[0m")
+    for sample in sample_replicate_files:
+        lines.append(f" - {sample}")
+
+    # Show all the comparisons that were made
+    lines.append("\033[1mCOMPARISONS:\033[0m")
+    for ref, contrasts in comparisons_dict.items():
+        for contrast in contrasts:
+            lines.append(f" - \033[4m{ref}\033[0m vs {contrast}")
+
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
+
+# Parse the plates on the plates_file
+plate_to_file = {}
+with open(plates_file, 'r') as f:
+    for line in f:
+        row = line.strip().split('\t')
+        plate_id = row[0]
+        plate_file = row[1]
+        plate_to_file[plate_id] = plate_file
+
+# Parse the samples and replicates on the samples_file
+df = pd.read_csv(samples_file, sep=",", header=None)
+# list of well IDs (used to declare demultiplexed FASTQ outputs)
+wells = df[0].tolist()
+
+# Use all plates from plate_to_file; demultiplex_fastq will create the demultiplexed files
+plate_ids_to_use = list(plate_to_file.keys())
+
+# Add a third column (index 2) with the fastq file path for each well ID in column 0
+# files will be named like: files_dir/demultiplex_<plate_id>_<well>.fastq.gz
+rows = []
+pdna_added = False
+for _, row in df.iterrows():
+    well = row.iloc[0]
+    sample = row.iloc[1]
+    for plate_id in plate_ids_to_use:
+        # Special-case: pDNA is a single file (no well). The plates file contains the read1 path for pDNA
+        if plate_id == "pDNA":
+            if not pdna_added:
+                path = plate_to_file.get("pDNA")
+                # sample name for pDNA is 'pDNA' and well is left empty
+                rows.append([None, "pDNA", path])
+                pdna_added = True
+        else:
+            path = os.path.join(demultiplex_dir, f"{plate_id}_{well}.fastq.gz")
+            rows.append([well, sample, path])
+
+# Create a new DataFrame from the accumulated rows (do not overwrite `df` while iterating it), with unique entries
+df = pd.DataFrame(rows).drop_duplicates().reset_index(drop=True)
+
+# Sanity check: expected rows is num_wells * num_plates (but pDNA contributes 1 row, not num_wells)
+num_wells = len(pd.read_csv(samples_file, sep=",", header=None))
+num_plates = len(plate_ids_to_use)
+num_pDNA = 1 if "pDNA" in plate_ids_to_use else 0
+expected_rows = num_wells * (num_plates - num_pDNA) + num_pDNA
+if len(df) != expected_rows:
+    print(f"Generated {len(df)} rows ({num_wells} wells * {num_plates - num_pDNA} plates + {num_pDNA} pDNA)")
+
+sample_replicate_files = {}
+# Iterate the DataFrame rows and populate the sample -> replicate -> fastq mapping
+for _, row in df.iterrows():
+    # sample name is in column 1, fastq path in column 2
+    sample = str(row.iloc[1])
+    fastq = row.iloc[2]
+    well = row.iloc[0]  # well ID from column 0
+    # For multi-plate experiments, we need to track samples by well_replicate (e.g., DMSO_1 from plate rep1 vs rep2)
+    # Create a key that includes well number for non-pDNA samples
+    if sample == "pDNA":
+        # pDNA has no well, just use sample name
+        sample_key = sample
+    else:
+        # Extract well number from sample name (e.g., "DMSO_1" -> "1", "minRT_10" -> "10")
+        # Sample names should be like "DMSO_1", "DMSO_2", "minRT_1", etc.
+        sample_key = sample
+    # Now assign replicate based on how many FASTQ files this sample_key has
+    if sample_key not in sample_replicate_files:
+        sample_replicate_files[sample_key] = {'1': fastq}
+    else:
+        # Get the replicate number based on how many files of this sample_key are there
+        replicate = str(len(sample_replicate_files[sample_key]) + 1)
+        sample_replicate_files[sample_key][replicate] = fastq
+
+
+# Parse all the comparisons in the comparisons file
+comparisons_dict = {}
+with open(comparisons_file, 'r') as f:
+    for line in f:
+        row = line.strip().split('\t')
+        # Reference condition
+        ref_name = row[0]
+        # Add the list of contrasts
+        comparisons_dict[ref_name] = row[1:]
+
+# Get the paths to the annotated dataframes (used in rule 'get_activity_and_qc_plots')
+path_to_annotated_dfs = [
+    os.path.join(output_dir, f"tmp_primetime/bc_counts/{sample}_{replicate}.cluster.annotated.txt")
+    for sample in sample_replicate_files
+    for replicate in sample_replicate_files[sample]
+]
+
+# Create a wildcard constraint for plate_id to avoid ambiguity
+plate_id_pattern = "|".join(re.escape(p) for p in plate_ids_to_use)
+
+##########################################################################################
+# Rules ##################################################################################
+##########################################################################################
+
+rule all:
+    input:
+        cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
+        pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
+        qc=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
+        heatmap_comparisons=os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
+        pca_plot=os.path.join(output_dir, "primetime_results/pca_conditions.pdf"),
+        tf_specific_plots=os.path.join(output_dir, "primetime_results/tf_specific_plots"),
+        all_comparisons=[
+            os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        ],
+        all_volcanos=[
+            os.path.join(output_dir, f"primetime_results/volcano_plots/{ref}_vs_{contrast}.pdf")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        ],
+        all_lollipops=[
+            os.path.join(output_dir, f"primetime_results/lollipop_plots/{ref}_vs_{contrast}.pdf")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        ]
+    message:
+        create_goodbye_message(sample_replicate_files, comparisons_dict)
+
+
+##########################################################################################
+
+# Get list of samples excluding pDNA (pDNA is a separate plate, not a sample)
+samples_excluding_pdna = [s for s in sample_replicate_files.keys() if s != "pDNA"]
+
+# 1a) Handle pDNA specially (just copy the file, no demultiplexing)
+rule demultiplex_pdna:
+    input:
+        r1=lambda wildcards: plate_to_file["pDNA"]
+    output:
+        fastq=os.path.join(demultiplex_dir, "pDNA.fastq.gz")
+    shell:
+        """
+        cp {input.r1} {output.fastq}
+        """
+
+# 1b) Demultiplex regular fastq plates
+rule demultiplex_fastq:
+    input:
+        r1=lambda wildcards: plate_to_file[wildcards.plate_id],
+        rt_cluster=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.cluster.txt")
+    output:
+        fastq=[os.path.join(demultiplex_dir, f"{{plate_id}}_{well}.fastq.gz") for well in wells],
+        stats=os.path.join(output_dir, "tmp_primetime/bc_counts/{plate_id}.demux.stats"),
+        invalid_bc=os.path.join(output_dir, "tmp_primetime/bc_counts/{plate_id}.invalid.txt")
+    wildcard_constraints:
+        plate_id="(?!pDNA)" + plate_id_pattern
+    params:
+        script=os.path.join(scripts_dir, "primetime_demultiplexing.py"),
+        rt_bc_upstream_seq=config["RT_BARCODE_UPSTREAM_SEQUENCE"],
+        bc_length=10,
+        max_mismatch=config["MAX_MISMATCH_DOWNSTREAM_SEQ"],
+        rt_barcode_map=config["RT_BARCODE_MAPPING_FILE"],
+        samples_file=samples_file,
+        out_base=demultiplex_dir,
+        plot_dir=os.path.join(output_dir, "primetime_QC"),
+    threads: 40
+    conda:
+        os.path.join(conda_envs_dir, "demultiplexing.yaml")
+    shell:
+        """
+        python {params.script} \
+    --fastq_r2 {input.r1} \
+    --read1 {input.r1} \
+--bc_length {params.bc_length} \
+--rt_bc_upstream_seq {params.rt_bc_upstream_seq} \
+--max_mismatch {params.max_mismatch} \
+--threads {threads} \
+--rt_barcode_map {params.rt_barcode_map} \
+--samples_file {params.samples_file} \
+--out_base {params.out_base} \
+--plot_dir {params.plot_dir} \
+--plate_id {wildcards.plate_id} \
+--stats_file {output.stats} \
+--invalid_bc_file {output.invalid_bc} \
+--rt_cluster_file {input.rt_cluster}
+        """
+
+
+##########################################################################################
+# 2) Get barcode counts
+rule get_barcode_counts:
+    input:
+        fastq=lambda wildcards: sample_replicate_files[wildcards.sample][wildcards.replicate],
+    output:
+        txt=os.path.join(output_dir, "tmp_primetime/bc_counts/{sample}_{replicate}.txt"),
+        stats=os.path.join(
+            output_dir, "tmp_primetime/bc_counts/{sample}_{replicate}.stats"
+        ),
+        invalid_bc_file=os.path.join(output_dir, "tmp_primetime/bc_counts/{sample}_{replicate}.invalid.txt")
+    params:
+        script=os.path.join(scripts_dir, "primetime_get_barcode_counts_screen.py"),
+        bc_length=config["BARCODE_LENGTH"],
+        bc_downstream_seq=config["BARCODE_DOWNSTREAM_SEQUENCE"],
+        max_mismatch=config["MAX_MISMATCH_DOWNSTREAM_SEQ"],
+    threads: 40
+    conda:
+        os.path.join(conda_envs_dir, "test_bc_counts.yaml")
+    shell:
+        """
+        python {params.script} \
+--fastq {input.fastq} \
+--bc_length {params.bc_length} \
+--bc_downstream_seq {params.bc_downstream_seq} \
+--max_mismatch {params.max_mismatch} \
+--threads {threads} \
+--invalid_bc_file {output.invalid_bc_file} \
+> {output.txt} 2> {output.stats}
+        """
+
+##########################################################################################
+
+# 3) Cluster barcodes
+rule cluster_barcodes:
+    input:
+        os.path.join(output_dir, "tmp_primetime/bc_counts/{sample}_{replicate}.txt"),
+    output:
+        clustered=os.path.join(
+            output_dir, "tmp_primetime/bc_counts/{sample}_{replicate}.cluster.txt"
+        ),
+        tmp=temp(os.path.join(
+            output_dir, "tmp_primetime/bc_counts/{sample}_{replicate}.input"
+        ))
+    params:
+        amount_spikes=10000,
+        bc_annotation=config["BARCODE_ANNOTATION_FILE"],
+    conda:
+        os.path.join(conda_envs_dir, "starcode.yaml")
+    threads: 20
+    shell:
+        """
+        # First, repeat every BC on the annotation 10000 times
+        tail -n +2 {params.bc_annotation} | awk -v FS=',' '{{for(i=1;i<={params.amount_spikes};i++) print $1}}' > {output.tmp}
+
+        # Now, concatenate the input and this and call starcode with standard clustering
+        cat {input} {output.tmp} | starcode \
+        --threads {threads} \
+        --print-clusters \
+        --quiet \
+        --dist 1 | \
+        sort -k1,1 > {output.clustered}
+        """
+# rule cluster_barcodes:
+#     input:
+#         os.path.join(output_dir, "tmp_primetime/bc_counts/{sample}_{replicate}.txt"),
+#     output:
+#         os.path.join(
+#             output_dir, "tmp_primetime/bc_counts/{sample}_{replicate}.cluster.txt"
+#         ),
+#     conda:
+#         os.path.join(conda_envs_dir, "starcode.yaml")
+#     threads: 10
+#     shell:
+#         """
+#         starcode --threads {threads} --print-clusters -i {input} --dist 1 2> /dev/null | \
+# sort -k1,1 > {output}
+#         """
+
+##########################################################################################
+
+# 4) Annotate the barcodes
+rule annotate_barcodes:
+    input:
+        clustered = os.path.join(
+            output_dir, "tmp_primetime/bc_counts/{sample}_{replicate}.cluster.txt"
+        ),
+        stats = os.path.join(output_dir, "tmp_primetime/bc_counts/{sample}_{replicate}.stats"),
+    output:
+        os.path.join(
+            output_dir,
+            "tmp_primetime/bc_counts/{sample}_{replicate}.cluster.annotated.txt",
+        ),
+    params:
+        script=os.path.join(scripts_dir, "primetime_annotate_barcodes.R"),
+        bc_annotation=config["BARCODE_ANNOTATION_FILE"],
+        amount_spikes=10000
+    conda:
+        os.path.join(conda_envs_dir, "r_plotting.yaml")
+    shell:
+        """
+        Rscript {params.script} \
+--bc_counts {input.clustered} \
+--stats {input.stats} \
+--amount_spikes {params.amount_spikes} \
+--bc_annotation {params.bc_annotation} \
+--sample {wildcards.sample} \
+--replicate_number {wildcards.replicate} \
+--output {output}
+        """
+
+##########################################################################################
+# 5) Get activity and QC plots
+rule get_activity_and_qc_plots:
+    input:
+        dfs=path_to_annotated_dfs
+    output:
+        bc_corr=os.path.join(output_dir, "primetime_QC/barcode_correlations.pdf"),
+        replicate_corr=os.path.join(
+            output_dir, "primetime_QC/replicate_correlations.pdf"
+        ),
+        expected_vs_obs=os.path.join(
+            output_dir, "primetime_QC/expected_vs_observed_pDNA_counts.pdf"
+        ),
+        read_counts=os.path.join(output_dir, "primetime_QC/read_counts.pdf"),
+        bc_counts=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
+        bleedthrough=os.path.join(
+            output_dir, "primetime_QC/bleedthrough_estimation.pdf"
+        ),
+        bleedthrough_data=os.path.join(
+            output_dir, "tmp_primetime/activity/bleedthrough_per_condition.txt"
+        ),
+        cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
+        pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
+    params:
+        script=os.path.join(scripts_dir, "primetime_get_activity_and_qc_plots.R"),
+        df_basedir=os.path.join(output_dir, "tmp_primetime/bc_counts"),
+        expected_pdna_counts=config["EXPECTED_PDNA_COUNTS"],
+        plots_basedir=os.path.join(output_dir, "primetime_QC/"),
+        activity_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
+    conda:
+        os.path.join(conda_envs_dir, "r_plotting.yaml")
+    shell:
+        """
+        mkdir -p {params.plots_basedir}
+        mkdir -p {params.activity_basedir}
+
+        # Write file list to temporary file, converting space-separated to newline-separated
+        temp_file_list=$(mktemp)
+        printf '%s\n' {input.dfs} > "$temp_file_list"
+
+        Rscript {params.script} --list_of_annotated_files "$temp_file_list" --plots_basedir {params.plots_basedir} --activity_basedir {params.activity_basedir} --expected_pdna {params.expected_pdna_counts} --cdna_output {params.activity_basedir}/cDNA_counts.txt
+
+        rm "$temp_file_list"
+        """
+
+##########################################################################################
+
+# rule normalize_cDNA_counts_per_promoter:
+#     input:
+#         os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
+#     output:
+#         os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts_normalized.txt"),
+#     params:
+#         script=os.path.join(scripts_dir, "primetime_normalize_counts_per_promoter.R"),
+#     conda:
+#         os.path.join(conda_envs_dir, "comparative_analysis.yaml")
+#     shell:
+#         """
+#         Rscript {params.script} \
+#         --input {input} \
+#         --output {output}
+#         """
+
+###########################################################################################
+# 6) Run comparative analysis
+rule run_comparative_analysis:
+    input:
+        cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
+        pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
+    output:
+        txt=os.path.join(output_dir, "primetime_results/output_data/{ref}_vs_{contrast}.txt"),
+        plots=os.path.join(output_dir, "primetime_results/volcano_plots/{ref}_vs_{contrast}.pdf"),
+        loli=os.path.join(output_dir, "primetime_results/lollipop_plots/{ref}_vs_{contrast}.pdf"),
+    params:
+        script=os.path.join(scripts_dir, "primetime_run_comparative_analysis_bcalm.R"),
+        out_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
+        pval_threshold=config["PVALUE_THRESHOLD"],
+        plot_output_dir=os.path.join(output_dir, "primetime_results"),
+        contrast_condition=lambda wildcards: wildcards.contrast,
+        num_replicates_contrast=lambda wildcards: len(sample_replicate_files[wildcards.contrast]),
+        reference_condition=lambda wildcards: wildcards.ref,
+        num_replicates_reference=lambda wildcards: len(sample_replicate_files[wildcards.ref]),
+        split_by_promoter=config.get("SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER", True)
+    conda:
+        os.path.join(conda_envs_dir, "comparative_analysis.yaml")
+    threads: 1
+    shell:
+        """
+        Rscript {params.script} \
+        --cdna {input.cDNA} \
+        --pdna {input.pDNA} \
+        --output {params.out_basedir} \
+        --pval_threshold {params.pval_threshold} \
+        --contrast_condition {params.contrast_condition} \
+        --num_replicates_contrast {params.num_replicates_contrast} \
+        --reference_condition {params.reference_condition} \
+        --num_replicates_reference {params.num_replicates_reference} \
+        --plot_output {params.plot_output_dir} \
+        --split_by_promoter {params.split_by_promoter} 
+        """
+
+##########################################################################################
+
+# 1c) Extract RT barcodes per plate (from R2)
+rule extract_rt_barcodes:
+    input:
+        r2=lambda wildcards: plate_to_file[wildcards.plate_id]
+    output:
+        rt=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.counts.txt")
+    wildcard_constraints:
+        plate_id="(?!pDNA)" + plate_id_pattern
+    params:
+        script=os.path.join(scripts_dir, "primetime_extract_rt_barcodes.py"),
+        rt_bc_upstream_seq=config["RT_BARCODE_UPSTREAM_SEQUENCE"],
+        bc_length=10,
+        max_mismatch=config["MAX_MISMATCH_DOWNSTREAM_SEQ"],
+    conda:
+        os.path.join(conda_envs_dir, "demultiplexing.yaml")
+    threads: 20
+    shell:
+        """
+        python {params.script} \
+--fastq_r2 {input.r2} \
+--bc_length {params.bc_length} \
+--rt_bc_upstream_seq {params.rt_bc_upstream_seq} \
+--max_mismatch {params.max_mismatch} \
+--output {output.rt}
+        """
+
+# 1d) Cluster extracted RT barcodes with starcode and spike corrects
+rule cluster_rt_barcodes:
+    input:
+        rt=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.counts.txt"),
+        rt_map=config["RT_BARCODE_MAPPING_FILE"]
+    output:
+        clustered=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.cluster.txt"),
+        tmp=temp(os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.spikes.txt"))
+    wildcard_constraints:
+        plate_id="(?!pDNA)" + plate_id_pattern
+    params:
+        amount_spikes=10000
+    conda:
+        os.path.join(conda_envs_dir, "starcode.yaml")
+    threads: 20
+    shell:
+        """
+        # Generate spike barcodes from rt_barcode map with Python for robust CSV parsing and sanitization
+        python - {params.amount_spikes} {input.rt_map} {output.tmp} << 'PYEOF'
+import csv, sys
+n = int(sys.argv[1])
+in_path = sys.argv[2]
+out_path = sys.argv[3]
+with open(in_path, newline='') as fh, open(out_path, 'w') as fo:
+    r = csv.reader(fh)
+    next(r, None)
+    for row in r:
+        if len(row) >= 2:
+            b = row[1].strip().strip(chr(34)).strip(chr(13))
+            if len(b) == 10 and set(b) <= set('ACGTN'):
+                for _ in range(n):
+                    fo.write(b + chr(10))
+PYEOF
+
+        # Expand counts file (barcode\tcount) to sequence list using Python, with sanitization
+        python - {input.rt} << 'PYEOF' | cat - {output.tmp} | starcode --threads {threads} --print-clusters --quiet --dist 2 | sort -k1,1 > {output.clustered}
+import sys
+inp = sys.argv[1]
+with open(inp) as fh:
+    for line in fh:
+        parts = line.strip().split(chr(9))
+        if len(parts) >= 2:
+            bc = parts[0].strip().strip(chr(34)).strip(chr(13))
+            try:
+                cnt = int(parts[1])
+            except Exception:
+                continue
+            if len(bc) == 10 and set(bc) <= set('ACGTN'):
+                for _ in range(cnt):
+                    print(bc)
+PYEOF
+        """
+
+# 7) Get heatmap of all conditions
+rule get_heatmap_of_conditions:
+    input:
+        results=expand(
+            os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        ),
+        bleedthrough=os.path.join(output_dir, "tmp_primetime/activity/bleedthrough_per_condition.txt")
+    output:
+        os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
+    params:
+        r_script=os.path.join(scripts_dir, "primetime_get_heatmap_of_conditions.R"),
+    conda:
+        os.path.join(conda_envs_dir, "r_plotting.yaml")
+    shell:
+        """
+        FILELIST=$(mktemp)
+        printf '%s\n' {input.results} > "$FILELIST"
+        Rscript {params.r_script} --results-file "$FILELIST" --bleedthrough {input.bleedthrough} --output {output}
+        rm "$FILELIST"
+        """
+
+##########################################################################################
+# 8) Get PCA plot of all conditions
+rule get_pca_plot:
+    input:
+        results=expand(
+            os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        ),
+        bleedthrough=os.path.join(output_dir, "tmp_primetime/activity/bleedthrough_per_condition.txt")
+    output:
+        os.path.join(output_dir, "primetime_results/pca_conditions.pdf"),
+    params:
+        r_script=os.path.join(scripts_dir, "primetime_get_pca_plot.R"),
+    conda:
+        os.path.join(conda_envs_dir, "r_plotting.yaml")
+    shell:
+        """
+        FILELIST=$(mktemp)
+        printf '%s\n' {input.results} > "$FILELIST"
+        Rscript {params.r_script} --results-file "$FILELIST" --bleedthrough {input.bleedthrough} --output {output}
+        rm "$FILELIST"
+        """
+
+##########################################################################################
+# 9) Get TF-specific plots (per-TF overview and lollipop plots)
+rule get_tf_specific_plots:
+    input:
+        results=expand(
+            os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        ),
+        barcodes=path_to_annotated_dfs,
+        well_map=config['SAMPLES_FILE'],
+    output:
+        directory(os.path.join(output_dir, "primetime_results/tf_specific_plots"))
+    params:
+        r_script=os.path.join(scripts_dir, "primetime_get_tf_specific_plots.R"),
+    conda:
+        os.path.join(conda_envs_dir, "r_plotting.yaml")
+    shell:
+        """
+        mkdir -p {output}
+        
+        FILELIST=$(mktemp)
+        printf '%s\n' {input.results} > "$FILELIST"
+        
+        BARCODE_DIR=$(dirname {input.barcodes[0]})
+        
+        Rscript {params.r_script} \
+            --results-file "$FILELIST" \
+            --barcode-dir "$BARCODE_DIR" \
+            --well-map {input.well_map} \
+            --output-dir {output}
+        
+        rm "$FILELIST"
+        """
