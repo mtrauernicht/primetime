@@ -147,7 +147,7 @@ for _, row in df.iterrows():
                 rows.append([None, "pDNA", path])
                 pdna_added = True
         else:
-            path = os.path.join(demultiplex_dir, f"{plate_id}_{sample}.fastq.gz")
+            path = os.path.join(demultiplex_dir, f"{plate_id}_{well}.fastq.gz")
             rows.append([well, sample, path])
 
 # Create a new DataFrame from the accumulated rows (do not overwrite `df` while iterating it), with unique entries
@@ -260,7 +260,7 @@ rule demultiplex_fastq:
         r1=lambda wildcards: plate_to_file[wildcards.plate_id].replace("_R2_001", "_R1_001"),
         rt_cluster=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.cluster.txt")
     output:
-        fastq=[os.path.join(demultiplex_dir, f"{{plate_id}}_{sample}.fastq.gz") for sample in samples_excluding_pdna],
+        fastq=[os.path.join(demultiplex_dir, f"{{plate_id}}_{well}.fastq.gz") for well in wells],
         stats=os.path.join(output_dir, "tmp_primetime/bc_counts/{plate_id}.demux.stats"),
         invalid_bc=os.path.join(output_dir, "tmp_primetime/bc_counts/{plate_id}.invalid.txt")
     wildcard_constraints:
@@ -444,12 +444,13 @@ rule get_activity_and_qc_plots:
         mkdir -p {params.plots_basedir}
         mkdir -p {params.activity_basedir}
 
-        Rscript {params.script} \
-        --list_of_annotated_files "{input}" \
-        --plots_basedir {params.plots_basedir} \
-        --activity_basedir {params.activity_basedir} \
-        --expected_pdna {params.expected_pdna_counts} \
-        --cdna_output {output.cDNA}
+        # Write file list to temporary file, converting space-separated to newline-separated
+        temp_file_list=$(mktemp)
+        printf '%s\n' {input.dfs} > "$temp_file_list"
+
+        Rscript {params.script} --list_of_annotated_files "$temp_file_list" --plots_basedir {params.plots_basedir} --activity_basedir {params.activity_basedir} --expected_pdna {params.expected_pdna_counts} --cdna_output {params.activity_basedir}/cDNA_counts.txt
+
+        rm "$temp_file_list"
         """
 
 ##########################################################################################
@@ -645,7 +646,7 @@ rule get_tf_specific_plots:
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ),
-        barcode_dir=os.path.join(output_dir, "tmp_primetime/bc_counts"),
+        barcodes=path_to_annotated_dfs,
         well_map=config['SAMPLES_FILE'],
     output:
         directory(os.path.join(output_dir, "primetime_results/tf_specific_plots"))
@@ -660,9 +661,11 @@ rule get_tf_specific_plots:
         FILELIST=$(mktemp)
         printf '%s\n' {input.results} > "$FILELIST"
         
+        BARCODE_DIR=$(dirname {input.barcodes[0]})
+        
         Rscript {params.r_script} \
             --results-file "$FILELIST" \
-            --barcode-dir {input.barcode_dir} \
+            --barcode-dir "$BARCODE_DIR" \
             --well-map {input.well_map} \
             --output-dir {output}
         

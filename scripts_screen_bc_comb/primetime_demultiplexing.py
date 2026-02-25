@@ -60,7 +60,8 @@ def parse_arguments():
     # Read containing the upstream sequence and barcode (typically read 2)
     parser.add_argument("--fastq", "--fastq_r2", dest="fastq_r2", type=str, required=True, help="Input R2 fastq file (contains RT barcode)")
     # Corresponding read 1 file whose records will be written to well-specific fastqs
-    parser.add_argument("--read1", type=str, required=True, help="Input R1 fastq file to split into well-specific fastqs")
+    # For read1-only demultiplexing, this can be omitted and the --fastq_r2 input will be used.
+    parser.add_argument("--read1", type=str, required=False, default=None, help="Input R1 fastq file to split into well-specific fastqs")
     parser.add_argument("--bc_length", type=int, required=True, help="Length of barcode to extract after the upstream sequence")
     parser.add_argument("--rt_bc_upstream_seq", type=str, required=True, help="Sequence upstream of barcode")
     parser.add_argument("--max_mismatch", type=int, default=0, help="Maximum number of mismatches allowed when matching upstream sequence")
@@ -116,6 +117,7 @@ def build_barcode_map(mapping_file):
     """Read the RT barcode mapping CSV (columns: well,barcode) and return
     a dict barcode -> well."""
     import csv
+    from Bio.Seq import Seq
 
     mapping = {}
     with open(mapping_file, "r", encoding="utf-8-sig") as fh:
@@ -124,7 +126,9 @@ def build_barcode_map(mapping_file):
             well = row.get("well") or row.get("Well") or row.get("WELL")
             barcode = row.get("barcode")
             if well and barcode:
-                mapping[barcode.strip()] = well.strip()
+                bc = barcode.strip()
+                bc_rc = str(Seq(bc).reverse_complement())
+                mapping[bc_rc] = well.strip()
     return mapping
 
 
@@ -169,6 +173,10 @@ def get_barcode_counts(fastq_r2,
     should NOT be demultiplexed but copied directly to out_base/pDNA.fastq.gz
     and recorded in the samples_output if requested.
     """
+    # If read1 is not provided, use fastq_r2 for both barcode extraction and output
+    if fastq_r1 is None:
+        fastq_r1 = fastq_r2
+
     # Handle pDNA short-circuit: copy input raw file into pDNA.fastq.gz
     if plate_id == "pDNA":
         os.makedirs(out_base, exist_ok=True)
@@ -377,17 +385,9 @@ def get_barcode_counts(fastq_r2,
     except Exception:
         sys.stderr.write("matplotlib/numpy not available, skipping per-well plot\n")
     else:
-        # Build list of rows and max column based on mapping or detected wells
-        rows = [chr(i) for i in range(ord('A'), ord('P') + 1)]
-        maxcol = 0
-        for w in set(barcode_to_well.values()):
-            m = re.match(r"([A-Za-z]+)(\d+)$", w)
-            if m:
-                col = int(m.group(2))
-                if col > maxcol:
-                    maxcol = col
-        if maxcol == 0:
-            maxcol = 24
+        # Build list of rows and max column for 96-well plate (A-H, 1-12)
+        rows = [chr(i) for i in range(ord('A'), ord('H') + 1)]
+        maxcol = 12
         mat = np.zeros((len(rows), maxcol), dtype=int)
         for well, count in well_counts.items():
             m = re.match(r"([A-Za-z]+)(\d+)$", well)

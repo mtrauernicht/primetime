@@ -8,5 +8,6 @@ dependencies:
 - libgcc=14.2.0=h77fa898_1
 - libgcc-ng=14.2.0=h69a702a_1
 - libgomp=14.2.0=h77fa898_1
+- python=3.13.1
 - starcode=1.4=h031d066_5
 

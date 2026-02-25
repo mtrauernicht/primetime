@@ -437,7 +437,7 @@ message("==== Writing BCalm results")
 message("Reference condition:", opt$reference_condition)
 message("Contrast condition:", opt$contrast_condition)
 
-plot_title <- paste(opt$contrast_condition, "vs.", opt$reference_condition, "(p.adjusted <=", p_threshold, ")")
+plot_title <- paste(opt$reference_condition, "vs.", opt$contrast_condition, "(p.adjusted <=", p_threshold, ")")
 message("Plot title:", plot_title)
 
 
@@ -510,7 +510,7 @@ plot_df %>%
             labs(
                 y = "Activity (log2(RPM+1))",
                 x = "",
-                title= paste(contrast_condition, "vs.", reference_condition)
+                title= paste(reference_condition, "vs.", contrast_condition)
             )
 invisible(dev.off())
 
