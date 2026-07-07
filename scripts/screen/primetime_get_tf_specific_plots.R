@@ -16,7 +16,7 @@ get_arg <- function(flag) {
 opt <- list(
     results_file = get_arg("--results-file"),
     barcode_dir = get_arg("--barcode-dir"),
-    design = get_arg("--design"),
+    reference_condition = get_arg("--reference-condition"),
     well_map = get_arg("--well-map"),
     output_dir = get_arg("--output-dir")
 )
@@ -61,13 +61,36 @@ if (is.null(all_results) || nrow(all_results) == 0) {
 message("Loaded results for ", length(unique(all_results$comparison_id)), " comparisons")
 message("Total TF-comparison pairs: ", nrow(all_results))
 
-# Load design file if provided (for sample -> condition mapping)
+find_existing_path <- function(paths) {
+    for (candidate in paths) {
+        if (file.exists(candidate)) return(candidate)
+    }
+    return(NA_character_)
+}
+
+# Auto-detect design file (for sample -> condition mapping)
 design <- NULL
-if (!is.na(opt$design) && file.exists(opt$design)) {
-    message("Loading design file...")
-    design <- read.delim(opt$design, sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+project_root <- dirname(dirname(opt$output_dir))
+design_path <- find_existing_path(c(
+    file.path(project_root, "tmp_primetime", "design.txt"),
+    file.path(dirname(opt$output_dir), "tmp_primetime", "design.txt")
+))
+if (!is.na(design_path) && file.exists(design_path)) {
+    message("Loading design file from: ", design_path)
+    design <- tryCatch({
+        read.delim(design_path, sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+    }, error = function(e) {
+        warning("Failed to read design file: ", e$message)
+        NULL
+    })
 } else {
-    message("No design file provided or file not found - will extract sample info from filenames")
+    message("Design file not found at ", design_path, " - inferring treatment from replicate names")
+}
+
+# Fallback when design is unavailable: infer treatment from replicate names
+infer_treatment <- function(x) {
+    # Common suffixes: _rep1, _R1, .1, -1
+    sub("(_rep[0-9]+|_R[0-9]+|\\.[0-9]+|-[0-9]+)$", "", x, ignore.case = TRUE)
 }
 
 # Load well map (maps well position -> sample name)
@@ -93,6 +116,42 @@ for (file in barcode_files) {
 }
 
 message("Loaded barcode annotations for ", length(all_barcodes), " samples")
+
+# Try to auto-detect cDNA counts file (used for replicate comparison plots)
+cdna_df <- NULL
+pDNA_df <- NULL
+cdna_path <- find_existing_path(c(
+    file.path(project_root, "tmp_primetime", "activity", "cDNA_counts.txt"),
+    file.path(dirname(opt$output_dir), "tmp_primetime", "activity", "cDNA_counts.txt")
+))
+if (!is.na(cdna_path) && file.exists(cdna_path)) {
+    message("Loading cDNA counts file from: ", cdna_path)
+    cdna_df <- tryCatch({
+        read.table(cdna_path, header = TRUE, stringsAsFactors = FALSE)
+    }, error = function(e) {
+        warning("Failed to read cDNA counts: ", e$message)
+        NULL
+    })
+} else {
+    message("cDNA counts file not found at ", cdna_path, " - skipping replicate plots")
+}
+
+pDNA_path <- find_existing_path(c(
+    file.path(project_root, "tmp_primetime", "activity", "pDNA_counts.txt"),
+    file.path(dirname(opt$output_dir), "tmp_primetime", "activity", "pDNA_counts.txt")
+))
+if (!is.na(pDNA_path) && file.exists(pDNA_path)) {
+    message("Loading pDNA counts file from: ", pDNA_path)
+    pDNA_df <- tryCatch({
+        read.table(pDNA_path, header = TRUE, stringsAsFactors = FALSE)
+    }, error = function(e) {
+        warning("Failed to read pDNA counts: ", e$message)
+        NULL
+    })
+} else {
+    message("pDNA counts file not found at ", pDNA_path, " - replicate plots will fall back to RPM")
+}
+
 
 # Create output directory
 dir.create(opt$output_dir, showWarnings = FALSE, recursive = TRUE)
@@ -305,34 +364,62 @@ create_tf_lollipop <- function(tf_name, all_results_df) {
         return(NULL)
     }
     
-    # Create a formatted label for each comparison
-    tf_results$comparison_label <- sapply(tf_results$comparison_id, function(comp_id) {
-        parts <- strsplit(comp_id, "_vs_")[[1]]
-        if (length(parts) == 2) {
-            parts[2]  # Just the contrast condition name
-        } else {
-            comp_id
-        }
-    })
-    
-    # Get reference and contrast values if they exist in the results
+    # Initialize activity columns and a robust comparison label (use contrast)
     tf_results$reference_activity <- NA
     tf_results$contrast_activity <- NA
-    
-    # Extract reference and contrast condition names
+    tf_results$comparison_label <- NA_character_
+
+    # Extract reference and contrast condition names robustly per-row
     for (i in 1:nrow(tf_results)) {
         comp_parts <- strsplit(tf_results$comparison_id[i], "_vs_")[[1]]
+        comp_id <- tf_results$comparison_id[i]
         if (length(comp_parts) == 2) {
-            ref_col <- comp_parts[1]
-            contrast_col <- comp_parts[2]
-            
-            # Look for columns matching these names (the actual activity values)
-            if (ref_col %in% colnames(tf_results)) {
-                tf_results$reference_activity[i] <- as.numeric(tf_results[i, ref_col])
+            p1 <- comp_parts[1]
+            p2 <- comp_parts[2]
+
+            found1 <- p1 %in% colnames(tf_results)
+            found2 <- p2 %in% colnames(tf_results)
+
+            # Decide which part is the contrast condition
+            contrast_col <- NA_character_
+            if (found2 && !found1) {
+                contrast_col <- p2
+            } else if (found1 && !found2) {
+                contrast_col <- p1
+            } else if (found1 && found2) {
+                # Both columns present: use logFC sign to infer which is contrast
+                lfc <- as.numeric(tf_results$logFC[i])
+                val1 <- as.numeric(tf_results[i, p1])
+                val2 <- as.numeric(tf_results[i, p2])
+                if (!is.na(lfc) && !is.na(val1) && !is.na(val2)) {
+                    diff <- val2 - val1
+                    if ((diff > 0 && lfc > 0) || (diff < 0 && lfc < 0)) {
+                        contrast_col <- p2
+                    } else {
+                        contrast_col <- p1
+                    }
+                } else {
+                    contrast_col <- p2
+                }
+            } else {
+                # Neither column present: fall back to second part as contrast
+                contrast_col <- p2
             }
-            if (contrast_col %in% colnames(tf_results)) {
+
+            # Assign activities if the corresponding columns exist
+            if (!is.na(contrast_col) && contrast_col %in% colnames(tf_results)) {
                 tf_results$contrast_activity[i] <- as.numeric(tf_results[i, contrast_col])
             }
+            # Reference is the other part if present
+            other_col <- ifelse(contrast_col == p1, p2, p1)
+            if (!is.na(other_col) && other_col %in% colnames(tf_results)) {
+                tf_results$reference_activity[i] <- as.numeric(tf_results[i, other_col])
+            }
+
+            # Use the chosen contrast_col as the x-axis label (fall back to comp_id)
+            tf_results$comparison_label[i] <- ifelse(is.na(contrast_col), comp_id, contrast_col)
+        } else {
+            tf_results$comparison_label[i] <- comp_id
         }
     }
     
@@ -457,6 +544,93 @@ for (tf in all_tfs) {
             plot_count <- plot_count + n_plates
         } else {
             message("  - ", tf, " - no plate data")
+        }
+
+        # Generate per-TF replicate comparison plot if cDNA counts are available
+        if (!is.null(cdna_df)) {
+            ref_cond <- ifelse(is.na(opt$reference_condition) || opt$reference_condition == "", "Control", opt$reference_condition)
+
+            barcode_meta <- intersect(c("barcode", "tf", "negative_control", "promoter"), colnames(cdna_df))
+
+            # Prepare pDNA values per barcode for log2(cDNA/pDNA)
+            pDNA_mean <- NULL
+            if (!is.null(pDNA_df) && "barcode" %in% colnames(pDNA_df)) {
+                pDNA_counts <- pDNA_df
+                pDNA_num_cols <- setdiff(colnames(pDNA_counts), "barcode")
+                for (col in pDNA_num_cols) {
+                    pDNA_counts[[col]] <- as.numeric(pDNA_counts[[col]])
+                }
+                if (length(pDNA_num_cols) > 0) {
+                    pDNA_counts$pDNA_mean <- rowMeans(pDNA_counts[, pDNA_num_cols, drop = FALSE], na.rm = TRUE)
+                } else {
+                    pDNA_counts$pDNA_mean <- NA_real_
+                }
+                pDNA_mean <- pDNA_counts[, c("barcode", "pDNA_mean")]
+            }
+
+            # Prepare counts: remove optional columns if present
+            counts <- cdna_df
+            drop_cols <- intersect(c("negative_control", "promoter"), colnames(counts))
+            if (length(drop_cols) > 0) counts <- counts[, setdiff(colnames(counts), drop_cols), drop = FALSE]
+
+            # Convert numeric columns (replicates) to log2(cDNA/pDNA)
+            num_cols <- setdiff(colnames(counts), c("tf", "negative_control", "promoter", "barcode"))
+            for (col in num_cols) {
+                counts[[col]] <- as.numeric(counts[[col]])
+            }
+
+            # Melt to long format using data.table
+            counts_dt <- data.table::as.data.table(counts)
+            long_dt <- data.table::melt(counts_dt, id.vars = c("barcode", "tf", intersect(c("negative_control", "promoter"), colnames(counts_dt))), variable.name = "replicate", value.name = "cDNA_count")
+            long_df <- as.data.frame(long_dt)
+
+            if (!is.null(pDNA_mean)) {
+                long_df <- merge(long_df, pDNA_mean, by = "barcode", all.x = TRUE)
+                long_df$activity_log2 <- log2((as.numeric(long_df$cDNA_count) + 1) / (as.numeric(long_df$pDNA_mean) + 1))
+            } else {
+                long_df$activity_log2 <- log2(as.numeric(long_df$cDNA_count) + 1)
+            }
+
+            # Merge with design if available; otherwise infer treatment from replicate names
+            if (!is.null(design) && "replicate" %in% colnames(design)) {
+                merged <- merge(long_df, design, by.x = "replicate", by.y = "replicate", all.x = TRUE)
+            } else {
+                merged <- long_df
+                merged$treatment <- infer_treatment(merged$replicate)
+            }
+            if ("pDNA" %in% colnames(merged)) {
+                merged <- merged[merged$pDNA != "True", ]
+            }
+
+            # Filter to TF
+            tf_df <- merged[merged$tf == tf, ]
+            if (nrow(tf_df) > 0) {
+                # Create treatment_col similar to bc_counts script
+                if ("treatment" %in% colnames(tf_df) && "sig" %in% colnames(tf_df)) {
+                    tf_df$treatment_col <- ifelse(tf_df$treatment == ref_cond, "Control condition", tf_df$sig)
+                } else if ("treatment" %in% colnames(tf_df)) {
+                    tf_df$treatment_col <- tf_df$treatment
+                } else {
+                    tf_df$treatment_col <- "Unknown"
+                }
+
+                # Plot
+                p_rep <- ggplot(tf_df, aes(x = replicate, y = activity_log2)) +
+                    geom_point(aes(color = treatment_col)) +
+                    scale_color_manual(values = c("Control condition" = "#000000", "NS" = "grey", "Downregulated" = "#6495ed", "Upregulated" = "#f37f80", "Unknown" = "grey")) +
+                    labs(title = paste0("Replicate activity: ", tf), x = "Replicate", y = "Log2(cDNA/pDNA)") +
+                    theme_bw() +
+                    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+                # Add violin layer if treatment_col exists
+                p_rep <- p_rep + ggplot2::geom_violin(aes(fill = treatment_col, color = treatment_col), alpha = 0.4, width = 1) +
+                    scale_fill_manual(values = c("Control condition" = "#00000033", "NS" = "#e4e4e455", "Downregulated" = "#6495ed33", "Upregulated" = "#f37f8033", "Unknown" = "#e4e4e455"))
+
+                out_file <- file.path(opt$output_dir, paste0(tf, "_replicates.pdf"))
+                ggsave(out_file, p_rep, width = 8, height = 6, useDingbats = FALSE)
+                message("  ✓ ", tf, " - replicate plot")
+                plot_count <- plot_count + 1
+            }
         }
     }, error = function(e) {
         message("  ✗ ", tf, " - Error: ", e$message)

@@ -226,7 +226,7 @@ pca_scores$distance <- sqrt((pca_scores$PC1 - centroid[1])^2 +
 # Identify top conditions by spread (top 25% or at least 3)
 n_label <- max(3, ceiling(nrow(pca_scores) * 0.25))
 pca_scores$label <- ""
-top_indices <- order(pca_scores$distance, decreasing=TRUE)[1:min(n_label, nrow(pca_scores))]
+top_indices <- order(pca_scores$distance, decreasing = TRUE)[seq_len(min(n_label, nrow(pca_scores)))]
 pca_scores$label[top_indices] <- pca_scores$condition[top_indices]
 
 # Calculate variance explained
@@ -319,10 +319,10 @@ p_pc2_loadings <- ggplot(top_pc2, aes(x=reorder(tf, loading_PC2), y=loading_PC2,
 
 # Combine plots (PCA in center, loadings on sides)
 library(patchwork)
-p_combined <- p + (p_pc1_loadings / p_pc2_loadings) + plot_layout(widths=c(2, 1))
+p_combined <- p + (p_pc1_loadings / p_pc2_loadings) + plot_layout(widths = c(2.5, 1))
 
 # Save combined plot
-ggsave(opt$output, p_combined, width=14, height=8)
+ggsave(opt$output, p_combined, width = 18, height = 10, limitsize = FALSE)
 
 cat("PCA plot saved to:", opt$output, "\n")
 cat("Total conditions:", nrow(pca_scores), "\n")

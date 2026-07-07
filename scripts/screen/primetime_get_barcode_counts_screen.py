@@ -97,6 +97,7 @@ def get_barcode_counts(fastq, bc_length, bc_downstream_seq, max_mismatch, num_co
     mismatched = 0
     total_reads = 0
     results = []
+    invalids = []
 
     with gzip.open(fastq, "rt") as handle:
         records = list(SeqIO.parse(handle, "fastq"))
@@ -107,13 +108,13 @@ def get_barcode_counts(fastq, bc_length, bc_downstream_seq, max_mismatch, num_co
         futures = [executor.submit(process_chunk, chunk, regex_pattern, bc_length) for chunk in chunks]
         for future in as_completed(futures):
             try:
-                m_valid, m_invalid, mm, t_reads, res, invalids = future.result()
+                m_valid, m_invalid, mm, t_reads, res, chunk_invalids = future.result()
                 matched_and_valid += m_valid
                 matched_but_invalid += m_invalid
                 mismatched += mm
                 total_reads += t_reads
                 results.extend(res)
-                invalids.extend(invalids)
+                invalids.extend(chunk_invalids)
                 # sys.stdout.write(f"Processed chunk: {t_reads} reads\n")
             except Exception as e:
                 sys.stderr.write(f"Error processing chunk: {e}\n")
@@ -131,6 +132,10 @@ def get_barcode_counts(fastq, bc_length, bc_downstream_seq, max_mismatch, num_co
 # Write statistics
 # ==============================================================================
 def write_stats(matched_and_valid, matched_but_invalid, mismatched, total_reads):
+    if total_reads == 0:
+        sys.stderr.write("No reads processed.\n")
+        return
+
     mismatched_pct = mismatched / total_reads * 100
     matched_and_valid_pct = matched_and_valid / total_reads * 100
     matched_but_invalid_pct = matched_but_invalid / total_reads * 100

@@ -51,7 +51,8 @@ option_list <- list(
         make_option(c("--num_replicates_contrast"), type = "integer", default = 1, help = "Number of replicates for the contrast condition"),
         make_option(c("--num_replicates_reference"), type = "integer", default = 1, help = "Number of replicates for the reference condition"),
         make_option(c("--single_model"), type = "logical", default = FALSE, help = "Whether to make a single model for all the TFs or not"),
-        make_option(c("--split_by_promoter"), type = "logical", default = TRUE, help = "Whether to split the analysis by promoter or not")
+        make_option(c("--split_by_promoter"), type = "logical", default = TRUE, help = "Whether to split the analysis by promoter or not"),
+        make_option(c("--normalize"), type = "logical", default = TRUE, help = "Whether to normalize activities by promoter-specific negative controls")
 )
 
 opt_parser <- OptionParser(option_list = option_list)
@@ -67,6 +68,8 @@ name_of_the_pdna_replicate <- colnames(pdna) %>% setdiff(c("barcode", "negative_
 
 contrast_condition <- opt$contrast_condition
 reference_condition <- opt$reference_condition
+normalize_counts <- isTRUE(opt$normalize)
+logfc_threshold <- if (normalize_counts) 0.263 else 0
 
 # Setup the replicates that are gonna be used here
 ref_replicates = paste0(reference_condition, "_", 1:opt$num_replicates_reference)
@@ -94,8 +97,8 @@ design_df <- data.frame(
         )
 )
 
-output_pdf_name <- paste0(reference_condition, "_vs_", contrast_condition, ".pdf")
-output_txt_name <- paste0(reference_condition, "_vs_", contrast_condition, ".txt")
+output_pdf_name <- paste0(contrast_condition, "_vs_", reference_condition, ".pdf")
+output_txt_name <- paste0(contrast_condition, "_vs_", reference_condition, ".txt")
 p_threshold <- opt$pval_threshold
 
 df <-
@@ -378,6 +381,43 @@ if (opt$split_by_promoter) {
 }
 
 
+if (normalize_counts) {
+                                # Correcting the activities by dividing by the median of the negative controls per promoter
+                                message("==== Correcting activities by negative controls median")
+                                # Get the median of the negative controls per condition and promoter
+                                tf_promoter_map <- df %>% distinct(tf, promoter)
+
+                                negative_control_medians <- all_results %>%
+                                        filter(grepl("RANDOM", tf)) %>%
+                                        left_join(tf_promoter_map, by = "tf") %>%
+                                        group_by(promoter) %>%
+                                        summarise(
+                                                median_reference = median(!!sym(reference_condition), na.rm = TRUE),
+                                                median_contrast  = median(!!sym(contrast_condition),  na.rm = TRUE),
+                                                .groups = "drop"
+                                        )
+
+                                all_results <- all_results %>%
+                                        left_join(tf_promoter_map, by = "tf") %>%                # add promoter column
+                                        left_join(negative_control_medians, by = "promoter") %>%
+                                        mutate(
+                                                !!reference_condition := !!sym(reference_condition) - coalesce(median_reference, 0),
+                                                !!contrast_condition := !!sym(contrast_condition) - coalesce(median_contrast, 0)
+                                        ) %>%
+                                        select(-median_reference, -median_contrast, -promoter)
+
+
+                                # Compute logFC again after correction
+                                all_results <- all_results %>%
+                                                                mutate(
+                                                                                                # first save the old logFC
+                                                                                                old_logFC = logFC,
+                                                                                                # then compute the new logFC
+                                                                                                logFC = !!sym(contrast_condition) - !!sym(reference_condition)
+                                                                )
+} else {
+                                all_results <- all_results %>% mutate(old_logFC = logFC)
+}
 
 # Correcting the p-values for multiple testing
 message("==== Correcting p-values")
@@ -386,8 +426,8 @@ all_results <- all_results %>%
                 # adjust p-values
                 p_adjusted = p.adjust(P.Value, method = "BH"),
                 # define significance: original BCalm logFC should be in the correct direction, new logFC should have a certain magnitude
-                sig = ifelse(logFC > 0  & p_adjusted <= p_threshold, "Upregulated",
-                        ifelse(logFC < 0 & p_adjusted <= p_threshold, "Downregulated",
+                sig = ifelse(logFC > logfc_threshold & old_logFC > 0 & p_adjusted <= p_threshold, "Upregulated",
+                        ifelse(logFC < -logfc_threshold & old_logFC < 0 & p_adjusted <= p_threshold, "Downregulated",
                                 "NS"
                         )
                 )
@@ -404,7 +444,7 @@ message("==== Writing BCalm results")
 message("Reference condition:", opt$reference_condition)
 message("Contrast condition:", opt$contrast_condition)
 
-plot_title <- paste(opt$reference_condition, "vs.", opt$contrast_condition, "(p.adjusted <=", p_threshold, ")")
+plot_title <- paste(opt$contrast_condition, "vs.", opt$reference_condition, "(p.adjusted <=", p_threshold, ")")
 message("Plot title:", plot_title)
 
 
@@ -477,7 +517,7 @@ plot_df %>%
             labs(
                 y = "Activity (log2(RPM+1))",
                 x = "",
-                title= paste(reference_condition, "vs.", contrast_condition)
+                                title= paste(contrast_condition, "vs.", reference_condition)
             )
 invisible(dev.off())
 

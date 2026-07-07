@@ -40,7 +40,8 @@ option_list <- list(
     make_option(c("--activity_basedir"), type = "character", help = "Basedir for the MPRAnalyze files"),
     make_option(c("--design"), type = "character", help = "Design DF with sample names"),
     make_option(c("--expected_pdna"), type = "character", help = "Path to expected pDNA counts"),
-    make_option(c("--cdna_output"), type = "character", help = "Path to save the cDNA counts for MPRAnalyze")
+    make_option(c("--cdna_output"), type = "character", help = "Path to save the cDNA counts for MPRAnalyze"),
+    make_option(c("--barcode_activity_output"), type = "character", help = "Path to save barcode-level activity used for barcode correlations")
 )
 
 # Functions for the plots
@@ -530,6 +531,23 @@ for (this_cdna_sample in cdna_sample) {
             )
         )
     }
+}
+
+barcode_activity_df <- activity_df %>%
+    filter(!negative_control) %>%
+    group_by(cDNA_sample, barcode, tf, promoter) %>%
+    summarise(
+        mean_RPM = mean(activity_RPM),
+        log2_mean_RPM = log2(mean_RPM),
+        .groups = "drop"
+    )
+
+if (!is.null(opt$barcode_activity_output)) {
+    write.table(
+        barcode_activity_df,
+        file = opt$barcode_activity_output,
+        row.names = FALSE, quote = F, sep = "\t"
+    )
 }
 
 ################################ PLOT REPLICATE CORRELATIONS #############################
