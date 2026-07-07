@@ -104,6 +104,15 @@ Example:
 PVALUE_THRESHOLD: 0.05
 ```
 
+## Optional: Turning normalization on or off
+
+Set `NORMALIZE_COUNTS` to `True` to keep the promoter-based activity correction, or to `False` to skip it and run the comparative analysis on the raw cDNA-derived activities.
+
+Example:
+```yaml
+NORMALIZE_COUNTS: True
+```
+
 ## Optional: Changing the library information
 
 There are some additional parameters on the config file related to the barcodes used in the analysis

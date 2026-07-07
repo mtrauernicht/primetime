@@ -45,7 +45,7 @@ __version__ = "1.0.0"
 # Setting up directories and paths
 filename = inspect.getframeinfo(inspect.currentframe()).filename
 base_dir = os.path.dirname(os.path.abspath(filename))
-scripts_dir = os.path.join(base_dir, "scripts_screen_bc_comb")
+scripts_dir = os.path.join(base_dir, "scripts_screen")
 conda_envs_dir = os.path.join(base_dir, "conda_envs")
 output_dir = config["OUTPUT_DIRECTORY"]
 comparisons_file = config['COMPARISONS_FILE']
@@ -219,17 +219,17 @@ rule all:
         pca_plot=os.path.join(output_dir, "primetime_results/pca_conditions.pdf"),
         tf_specific_plots=os.path.join(output_dir, "primetime_results/tf_specific_plots"),
         all_comparisons=[
-            os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
+            os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ],
         all_volcanos=[
-            os.path.join(output_dir, f"primetime_results/volcano_plots/{ref}_vs_{contrast}.pdf")
+            os.path.join(output_dir, f"primetime_results/volcano_plots/{contrast}_vs_{ref}.pdf")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ],
         all_lollipops=[
-            os.path.join(output_dir, f"primetime_results/lollipop_plots/{ref}_vs_{contrast}.pdf")
+            os.path.join(output_dir, f"primetime_results/lollipop_plots/{contrast}_vs_{ref}.pdf")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ]
@@ -256,7 +256,8 @@ rule demultiplex_pdna:
 # 1b) Demultiplex regular fastq plates
 rule demultiplex_fastq:
     input:
-        r1=lambda wildcards: plate_to_file[wildcards.plate_id],
+        r2=lambda wildcards: plate_to_file[wildcards.plate_id],
+        r1=lambda wildcards: plate_to_file[wildcards.plate_id].replace("_R2_001", "_R1_001"),
         rt_cluster=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.cluster.txt")
     output:
         fastq=[os.path.join(demultiplex_dir, f"{{plate_id}}_{well}.fastq.gz") for well in wells],
@@ -279,8 +280,8 @@ rule demultiplex_fastq:
     shell:
         """
         python {params.script} \
-    --fastq_r2 {input.r1} \
-    --read1 {input.r1} \
+--fastq_r2 {input.r2} \
+--read1 {input.r1} \
 --bc_length {params.bc_length} \
 --rt_bc_upstream_seq {params.rt_bc_upstream_seq} \
 --max_mismatch {params.max_mismatch} \
@@ -477,9 +478,9 @@ rule run_comparative_analysis:
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
     output:
-        txt=os.path.join(output_dir, "primetime_results/output_data/{ref}_vs_{contrast}.txt"),
-        plots=os.path.join(output_dir, "primetime_results/volcano_plots/{ref}_vs_{contrast}.pdf"),
-        loli=os.path.join(output_dir, "primetime_results/lollipop_plots/{ref}_vs_{contrast}.pdf"),
+        txt=os.path.join(output_dir, "primetime_results/output_data/{contrast}_vs_{ref}.txt"),
+        plots=os.path.join(output_dir, "primetime_results/volcano_plots/{contrast}_vs_{ref}.pdf"),
+        loli=os.path.join(output_dir, "primetime_results/lollipop_plots/{contrast}_vs_{ref}.pdf"),
     params:
         script=os.path.join(scripts_dir, "primetime_run_comparative_analysis_bcalm.R"),
         out_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
@@ -593,7 +594,7 @@ PYEOF
 rule get_heatmap_of_conditions:
     input:
         results=expand(
-            os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
+            os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ),
@@ -617,7 +618,7 @@ rule get_heatmap_of_conditions:
 rule get_pca_plot:
     input:
         results=expand(
-            os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
+            os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ),
@@ -641,7 +642,7 @@ rule get_pca_plot:
 rule get_tf_specific_plots:
     input:
         results=expand(
-            os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
+            os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ),

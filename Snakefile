@@ -48,6 +48,7 @@ conda_envs_dir = os.path.join(base_dir, "conda_envs")
 output_dir = config["OUTPUT_DIRECTORY"]
 comparisons_file = config['COMPARISONS_FILE']
 samples_file = config['SAMPLES_FILE']
+normalize_counts = "TRUE" if config.get("NORMALIZE_COUNTS", True) else "FALSE"
 
 
 # Goodbye message
@@ -151,17 +152,22 @@ rule all:
         qc=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
         heatmap_comparisons=os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
         all_comparisons=[
-            os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
+            os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ],
         all_volcanos=[
-            os.path.join(output_dir, f"primetime_results/volcano_plots/{ref}_vs_{contrast}.pdf")
+            os.path.join(output_dir, f"primetime_results/volcano_plots/{contrast}_vs_{ref}.pdf")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ],
         all_lollipops=[
-            os.path.join(output_dir, f"primetime_results/lollipop_plots/{ref}_vs_{contrast}.pdf")
+            os.path.join(output_dir, f"primetime_results/lollipop_plots/{contrast}_vs_{ref}.pdf")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        ],
+        all_top_tf_plots=[
+            os.path.join(output_dir, f"primetime_results/top_tf_barcode_counts/{contrast}_vs_{ref}.pdf")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ]
@@ -300,12 +306,14 @@ rule get_activity_and_qc_plots:
         ),
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
+        barcode_activity=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
     params:
         script=os.path.join(scripts_dir, "primetime_get_activity_and_qc_plots.R"),
         df_basedir=os.path.join(output_dir, "tmp_primetime/bc_counts"),
         expected_pdna_counts=config["EXPECTED_PDNA_COUNTS"],
         plots_basedir=os.path.join(output_dir, "primetime_QC/"),
         activity_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
+        barcode_activity_output=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
     conda:
         os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
@@ -318,36 +326,18 @@ rule get_activity_and_qc_plots:
         --plots_basedir {params.plots_basedir} \
         --activity_basedir {params.activity_basedir} \
         --expected_pdna {params.expected_pdna_counts} \
-        --cdna_output {output.cDNA}
+        --cdna_output {output.cDNA} \
+        --barcode_activity_output {params.barcode_activity_output}
         """
-
-##########################################################################################
-
-# rule normalize_cDNA_counts_per_promoter:
-#     input:
-#         os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
-#     output:
-#         os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts_normalized.txt"),
-#     params:
-#         script=os.path.join(scripts_dir, "primetime_normalize_counts_per_promoter.R"),
-#     conda:
-#         os.path.join(conda_envs_dir, "comparative_analysis.yaml")
-#     shell:
-#         """
-#         Rscript {params.script} \
-#         --input {input} \
-#         --output {output}
-#         """
-
 
 rule run_comparative_analysis:
     input:
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
     output:
-        txt=os.path.join(output_dir, "primetime_results/output_data/{ref}_vs_{contrast}.txt"),
-        plots=os.path.join(output_dir, "primetime_results/volcano_plots/{ref}_vs_{contrast}.pdf"),
-        loli=os.path.join(output_dir, "primetime_results/lollipop_plots/{ref}_vs_{contrast}.pdf"),
+        txt=os.path.join(output_dir, "primetime_results/output_data/{contrast}_vs_{ref}.txt"),
+        plots=os.path.join(output_dir, "primetime_results/volcano_plots/{contrast}_vs_{ref}.pdf"),
+        loli=os.path.join(output_dir, "primetime_results/lollipop_plots/{contrast}_vs_{ref}.pdf"),
     params:
         script=os.path.join(scripts_dir, "primetime_run_comparative_analysis_bcalm.R"),
         out_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
@@ -357,7 +347,8 @@ rule run_comparative_analysis:
         num_replicates_contrast=lambda wildcards: len(sample_replicate_files[wildcards.contrast]),
         reference_condition=lambda wildcards: wildcards.ref,
         num_replicates_reference=lambda wildcards: len(sample_replicate_files[wildcards.ref]),
-        split_by_promoter=config.get("SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER", True)
+        split_by_promoter=config.get("SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER", True),
+        normalize=normalize_counts
     conda:
         os.path.join(conda_envs_dir, "comparative_analysis.yaml")
     threads: 1
@@ -373,15 +364,56 @@ rule run_comparative_analysis:
         --reference_condition {params.reference_condition} \
         --num_replicates_reference {params.num_replicates_reference} \
         --plot_output {params.plot_output_dir} \
-        --split_by_promoter {params.split_by_promoter} 
+        --split_by_promoter {params.split_by_promoter} \
+        --normalize {params.normalize}
+        """
+
+##########################################################################################
+
+rule get_bc_counts_for_top_tfs:
+    input:
+        result=os.path.join(output_dir, "primetime_results/output_data/{contrast}_vs_{ref}.txt"),
+        cdna=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
+        pdna=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
+    output:
+        plot=os.path.join(output_dir, "primetime_results/top_tf_barcode_counts/{contrast}_vs_{ref}.pdf"),
+        design=temp(os.path.join(output_dir, "tmp_primetime/activity/design/{contrast}_vs_{ref}.txt")),
+    params:
+        script=os.path.join(scripts_dir, "primetime_get_bc_counts_for_top_tfs.R"),
+        reference_condition=lambda wildcards: wildcards.ref,
+        contrast_condition=lambda wildcards: wildcards.contrast,
+        num_replicates_reference=lambda wildcards: len(sample_replicate_files[wildcards.ref]),
+        num_replicates_contrast=lambda wildcards: len(sample_replicate_files[wildcards.contrast]),
+    conda:
+        os.path.join(conda_envs_dir, "r_plotting.yaml")
+    shell:
+        """
+        mkdir -p $(dirname {output.plot})
+        mkdir -p $(dirname {output.design})
+
+        echo -e "replicate\ttreatment\tsample\tpDNA" > {output.design}
+        for i in $(seq 1 {params.num_replicates_reference}); do
+            echo -e "{params.reference_condition}_$i\t{params.reference_condition}\t{params.reference_condition}\tFalse" >> {output.design}
+        done
+        for i in $(seq 1 {params.num_replicates_contrast}); do
+            echo -e "{params.contrast_condition}_$i\t{params.contrast_condition}\t{params.contrast_condition}\tFalse" >> {output.design}
+        done
+
+        Rscript {params.script} \
+        --result {input.result} \
+        --cdna {input.cdna} \
+        --pdna {input.pdna} \
+        --output {output.plot} \
+        --design {output.design} \
+        --reference_condition {params.reference_condition}
         """
 
 ##########################################################################################
 
 rule get_heatmap_of_conditions:
     input:
-        results=expand(
-            os.path.join(output_dir, f"primetime_results/output_data/{ref}_vs_{contrast}.txt")
+        expand(
+            os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         )
@@ -393,10 +425,10 @@ rule get_heatmap_of_conditions:
         os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
         """
-        if [ $(echo {input.results} | wc -w) -le 1 ]; then
+        if [ $(echo {input} | wc -w) -le 1 ]; then
             echo "Not enough input files for heatmap, skipping."; touch {output};
         else
-            results=$(echo {input.results} | tr ' ' ',')
+            results=$(echo {input} | tr ' ' ',')
             Rscript {params.script} \
             --results $results \
             --output {output} > /dev/null 2>&1
