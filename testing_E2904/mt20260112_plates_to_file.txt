@@ -1,7 +1,0 @@
-speedvac_r1_beads1.8	/shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files/8507_3_Robotics_R1_SV_1_8x_FIXME_r1_GATGCCGTCT-AAGGTAACCT_S39_R2_001.fastq.gz
-speedvac_r2_zymo	/shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files/8507_6_Robotics_R2_SV_Zymo_AGAGATGGTA-GCTTACGGAA_S42_R2_001.fastq.gz
-speedvac_r1_beads2.2	/shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files/8507_4_Robotics_R1_SV_2_2x_FIXME_a1_AGACGGCATC-GTGCTTGTGG_S40_R2_001.fastq.gz
-speedvac_r2_beads2.3	/shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files/8507_5_Robotics_R2_SV_2_2x_TTGGCCAGTT-ATGCTACCTG_S41_R2_001.fastq.gz
-precipitation_r1_ethanol	/shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files/8507_1_Robotics_R1_EtOH_CTAGTCAGAA-TTGAATGCTG_S37_R2_001.fastq.gz
-precipitation__r1_isopropanol	/shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files/8507_2_Robotics_R1_IPA_AAGACAGCTT-TCGCTGACCT_S38_R2_001.fastq.gz
-pDNA	/shared/gcf/h.yucel/8025/M1115_fastq_files/8025_17_pDNA_pMT52_5_V2_0_CCACCAGGCA-CGAGGTCGGA_S17_R1_001.fastq.gz
