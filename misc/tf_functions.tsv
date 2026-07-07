@@ -1,0 +1,101 @@
+﻿tf	biological_function
+POU5F1	Pluripotency maintenance/reprogramming
+SOX2	Pluripotency maintenance/reprogramming
+POU5F1::SOX2	Pluripotency maintenance/reprogramming
+KLF4	Pluripotency maintenance/reprogramming
+ESRRB	Pluripotency maintenance/reprogramming
+TFCP2L1	Pluripotency maintenance/reprogramming
+ZFP42	Pluripotency maintenance/reprogramming
+ZFX	Pluripotency maintenance/reprogramming
+NR5A2	Pluripotency maintenance/reprogramming
+AR	Steroid/thyroid/vitamin hormone signaling
+ESR1	Steroid/thyroid/vitamin hormone signaling
+PGR	Steroid/thyroid/vitamin hormone signaling
+THRA	Steroid/thyroid/vitamin hormone signaling
+THRB	Steroid/thyroid/vitamin hormone signaling
+VDR	Steroid/thyroid/vitamin hormone signaling
+NR3C1	Corticosteroid stress hormone signaling
+NR3C2	Corticosteroid stress hormone signaling
+RARA	Retinoid signaling
+RARA::RXRA	Retinoid signaling
+RXRA	Retinoid signaling
+PPARA	Lipid/sterol/bile acid metabolic sensing
+PPARG	Lipid/sterol/bile acid metabolic sensing
+NR1H2	Lipid/sterol/bile acid metabolic sensing
+NR1H4	Lipid/sterol/bile acid metabolic sensing
+NR1I2	Xenobiotic/toxin detoxification response
+NR1I3	Xenobiotic/toxin detoxification response
+AHR::ARNT	Xenobiotic/toxin detoxification response
+MTF1	Xenobiotic/toxin detoxification response
+NFKB1	Immune/inflammatory activation (NF-κB & NFAT)
+REL	Immune/inflammatory activation (NF-κB & NFAT)
+NFATC1	Immune/inflammatory activation (NF-κB & NFAT)
+NFAT5	Immune/inflammatory activation (NF-κB & NFAT)
+STAT1	Cytokine/interferon-JAK-STAT signaling
+STAT1::2	Cytokine/interferon-JAK-STAT signaling
+STAT3	Cytokine/interferon-JAK-STAT signaling
+STAT4	Cytokine/interferon-JAK-STAT signaling
+STAT6	Cytokine/interferon-JAK-STAT signaling
+IRF1	Cytokine/interferon-JAK-STAT signaling
+IRF3	Cytokine/interferon-JAK-STAT signaling
+HSF1	Cellular stress response (heat/oxidative/ER/metabolic)
+NFE2L2	Cellular stress response (heat/oxidative/ER/metabolic)
+MAF::NFE2	Cellular stress response (heat/oxidative/ER/metabolic)
+ATF4	Cellular stress response (heat/oxidative/ER/metabolic)
+ATF6	Cellular stress response (heat/oxidative/ER/metabolic)
+XBP1	Cellular stress response (heat/oxidative/ER/metabolic)
+E2F1	Cell cycle progression/proliferation
+MYC	Cell cycle progression/proliferation
+MYBL2	Cell cycle progression/proliferation
+FOS::JUN	AP-1/MAPK immediate-early growth response
+FOSL1	AP-1/MAPK immediate-early growth response
+ELK1	AP-1/MAPK immediate-early growth response
+EGR1	AP-1/MAPK immediate-early growth response
+SRF	AP-1/MAPK immediate-early growth response
+ATF2	AP-1/MAPK immediate-early growth response
+CREB1	AP-1/MAPK immediate-early growth response
+TEAD1	Hippo/YAP growth control
+TP53	DNA damage response/tumor suppression
+SMAD2::3::4	TGF-β/BMP/Notch developmental signaling
+SMAD4	TGF-β/BMP/Notch developmental signaling
+RBPJ	TGF-β/BMP/Notch developmental signaling
+TCF7	Wnt signaling
+TCF7L2	Wnt signaling
+GLI1	Hedgehog signaling
+GATA1	Endoderm/organ lineage specification
+GATA3	Endoderm/organ lineage specification
+GATA4	Endoderm/organ lineage specification
+ONECUT1	Endoderm/organ lineage specification
+HNF1A	Endoderm/organ lineage specification
+HNF4A	Endoderm/organ lineage specification
+FOXA1	Endoderm/organ lineage specification
+PAX6	Neural patterning & differentiation
+NEUROG2	Neural patterning & differentiation
+NFIA	Neural patterning & differentiation
+IRX3	Neural patterning & differentiation
+GBX2	Neural patterning & differentiation
+OTX1	Neural patterning & differentiation
+RORA	Neural patterning & differentiation
+SOX9	Mesenchymal/skeletal-muscle differentiation
+RUNX2	Mesenchymal/skeletal-muscle differentiation
+MEF2A	Mesenchymal/skeletal-muscle differentiation
+WT1	Kidney and gonad development
+GRHL1	Epithelial/epidermal & neural crest development
+TFAP2A	Epithelial/epidermal & neural crest development
+FOXO1	Stress-responsive metabolic/apoptotic signaling
+NR4A1	Stress-responsive metabolic/apoptotic signaling
+NR4A2	Stress-responsive metabolic/apoptotic signaling
+CLOCK	Circadian rhythm regulation
+NR1D1	Circadian rhythm regulation
+HIF1A	Hypoxia adaptive response
+NRF1	Mitochondrial/lysosomal biogenesis
+TFEB	Mitochondrial/lysosomal biogenesis
+SREBF1	Lipogenic biosynthesis
+CEBPA	Myeloid/acute-phase differentiation
+CEBPB	Myeloid/acute-phase differentiation
+SP1	Housekeeping/general promoter regulation
+NFYA	Housekeeping/general promoter regulation
+POU2F1	Housekeeping/general promoter regulation
+RFX1	Housekeeping/general promoter regulation
+HOMEZ	Housekeeping/general promoter regulation
+ETS2	Trophoblast/placental development
