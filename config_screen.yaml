@@ -11,7 +11,6 @@
 PLATES_FILE: /DATA/pipelines/primetime/testing_E2904/mt20260112_plates_to_file.txt
 ## Which samples (wells) should be processed?
 SAMPLES_FILE: /DATA/pipelines/primetime/testing_E2904/E2904_well_specification.csv
-FILES_DIRECTORY: /shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files
 DEMULTIPLEX_DIRECTORY: /shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files/demultiplex
 ## Which comparisons should be performed?
 COMPARISONS_FILE: /DATA/pipelines/primetime/testing_E2904/mt20260112_comparisons.txt
@@ -24,6 +23,8 @@ PVALUE_THRESHOLD: 0.01
 
 SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER: False
 
+NORMALIZE_COUNTS: True
+
 # ==============================================================================
 # ============================ Library parameters ==============================
 # Number of barcodes per TF
@@ -33,8 +34,8 @@ BARCODES_PER_TF: 5
 BARCODE_LENGTH: 12
 
 # BC downstream sequence: this will be used to identify the barcodes in the fastq files
-BARCODE_DOWNSTREAM_SEQUENCE: CATCGTCGCATCCAAGAGGCTAGCTAACTA
-RT_BARCODE_UPSTREAM_SEQUENCE: CGTGCTAAGGCTTGACGCGAATCGAGCC
+BARCODE_DOWNSTREAM_SEQUENCE: CATCGTCGCATCCAAGAGGC
+RT_BARCODE_UPSTREAM_SEQUENCE: CATCGTCGCATCCAAGAGGC
 
 # How many mismatches are allowed in the downstream sequence to identify the barcode?
 MAX_MISMATCH_DOWNSTREAM_SEQ: 3
