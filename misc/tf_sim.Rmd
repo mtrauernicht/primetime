@@ -1,0 +1,57 @@
+## Create similarity scores between TFs
+
+```{r}
+library(GOSemSim)
+library(dplyr)
+library(org.Hs.eg.db)
+library(tidyr)
+library(tibble)
+library(dplyr)
+library(reshape2)
+
+tf_list <- read.delim("/DATA/pipelines/primetime/misc/tf_functions.tsv", header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE) %>%
+  distinct(tf) %>%
+  mutate(tf = gsub("::.*", "", tf)) %>%
+  pull(tf)
+
+semData <- godata(org.Hs.eg.db, ont = "BP", keytype = "SYMBOL")
+
+tf_sim <- matrix(NA_real_, nrow = length(tf_list), ncol = length(tf_list),
+                 dimnames = list(tf_list, tf_list))
+
+for (i in seq_along(tf_list)) {
+    for (j in i:length(tf_list)) {
+        val <- tryCatch({
+            geneSim(tf_list[i], tf_list[j], semData = semData, measure = "Wang")$geneSim
+        }, error = function(e) NA_real_)
+        if (length(val) != 1 || is.nan(val)) val <- NA_real_
+        tf_sim[i, j] <- val
+        tf_sim[j, i] <- val
+    }
+}
+
+
+# Map back heterodimers
+rename_map <- c("POU5F1.1" = "POU5F1::SOX2",
+                "RARA.1"   = "RARA::RXRA",
+                "AHR"      = "AHR::ARNT",
+                "STAT1.1"  = "STAT1::STAT2",
+                "MAF"      = "MAF::NFE2",
+                "FOS"      = "FOS::JUN",
+                "SMAD2"    = "SMAD2::3::4")
+
+
+tf_sim_long <- melt(tf_sim, varnames = c("tf1", "tf2"), value.name = "similarity")
+
+tf_sim_long <- tf_sim_long %>%
+    mutate(
+        tf1 = recode(tf1, !!!rename_map),
+        tf2 = recode(tf2, !!!rename_map)
+    )
+
+
+write.csv(tf_sim, file = "/DATA/pipelines/primetime/misc/tf_similarity_gosemsim.csv", quote = FALSE)
+
+```
+
+
