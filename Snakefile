@@ -49,6 +49,7 @@ output_dir = config["OUTPUT_DIRECTORY"]
 comparisons_file = config['COMPARISONS_FILE']
 samples_file = config['SAMPLES_FILE']
 normalize_counts = "TRUE" if config.get("NORMALIZE_COUNTS", True) else "FALSE"
+viability_file = str(config.get("VIABILITY_FILE", "")).strip()
 
 
 # Goodbye message
@@ -151,6 +152,7 @@ rule all:
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
         qc=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
         heatmap_comparisons=os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
+        umap_plot=os.path.join(output_dir, "primetime_results/umap_conditions.pdf"),
         all_comparisons=[
             os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
             for ref, contrasts in comparisons_dict.items()
@@ -301,6 +303,8 @@ rule get_activity_and_qc_plots:
         ),
         read_counts=os.path.join(output_dir, "primetime_QC/read_counts.pdf"),
         bc_counts=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
+        control_bc_corr=os.path.join(output_dir, "primetime_QC/control_barcode_correlations.pdf"),
+        viability_heatmap=os.path.join(output_dir, "primetime_QC/viability_well_heatmap.pdf"),
         bleedthrough=os.path.join(
             output_dir, "primetime_QC/bleedthrough_estimation.pdf"
         ),
@@ -314,6 +318,7 @@ rule get_activity_and_qc_plots:
         plots_basedir=os.path.join(output_dir, "primetime_QC/"),
         activity_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
         barcode_activity_output=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
+        viability_file=viability_file,
     conda:
         os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
@@ -321,13 +326,20 @@ rule get_activity_and_qc_plots:
         mkdir -p {params.plots_basedir}
         mkdir -p {params.activity_basedir}
 
+        viability_args=()
+        if [[ -n "{params.viability_file}" ]]; then
+            viability_args+=(--viability_file "{params.viability_file}")
+        fi
+
         Rscript {params.script} \
         --list_of_annotated_files "{input}" \
+        --design {samples_file} \
         --plots_basedir {params.plots_basedir} \
         --activity_basedir {params.activity_basedir} \
         --expected_pdna {params.expected_pdna_counts} \
         --cdna_output {output.cDNA} \
-        --barcode_activity_output {params.barcode_activity_output}
+        --barcode_activity_output {params.barcode_activity_output} \
+        "${{viability_args[@]}}"
         """
 
 rule run_comparative_analysis:
@@ -338,6 +350,7 @@ rule run_comparative_analysis:
         txt=os.path.join(output_dir, "primetime_results/output_data/{contrast}_vs_{ref}.txt"),
         plots=os.path.join(output_dir, "primetime_results/volcano_plots/{contrast}_vs_{ref}.pdf"),
         loli=os.path.join(output_dir, "primetime_results/lollipop_plots/{contrast}_vs_{ref}.pdf"),
+        circular_loli=os.path.join(output_dir, "primetime_results/circular_lollipop_plots/{contrast}_vs_{ref}.pdf"),
     params:
         script=os.path.join(scripts_dir, "primetime_run_comparative_analysis_bcalm.R"),
         out_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
@@ -433,4 +446,27 @@ rule get_heatmap_of_conditions:
             --results $results \
             --output {output} > /dev/null 2>&1
         fi
+        """
+
+##########################################################################################
+# 8) Get UMAP plot of all conditions
+rule get_umap_plot:
+    input:
+        results=expand(
+            os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        )
+    output:
+        os.path.join(output_dir, "primetime_results/umap_conditions.pdf"),
+    params:
+        r_script=os.path.join(scripts_dir, "primetime_get_pca_plot.R"),
+    conda:
+        os.path.join(conda_envs_dir, "r_plotting.yaml")
+    shell:
+        """
+        FILELIST=$(mktemp)
+        printf '%s\n' {input.results} > "$FILELIST"
+        Rscript {params.r_script} --results-file "$FILELIST" --output {output}
+        rm "$FILELIST"
         """
