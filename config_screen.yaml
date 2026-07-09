@@ -48,3 +48,6 @@ EXPECTED_PDNA_COUNTS: /DATA/pipelines/primetime/misc/expected_pDNA_counts.txt
 
 # Path to RT barcode to well mapping file
 RT_BARCODE_MAPPING_FILE: /DATA/pipelines/primetime/misc/rt_barcode.csv
+
+# Optional semicolon-separated viability matrix; leave empty to skip the QC plot
+VIABILITY_FILE: ""
