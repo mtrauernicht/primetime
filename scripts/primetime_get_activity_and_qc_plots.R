@@ -27,6 +27,7 @@ suppressPackageStartupMessages({
     library(ggrepel)
     library(rlang)
     library(purrr)
+    library(ggrastr)
 })
 options(
     dplyr.width = Inf,
@@ -41,7 +42,8 @@ option_list <- list(
     make_option(c("--design"), type = "character", help = "Design DF with sample names"),
     make_option(c("--expected_pdna"), type = "character", help = "Path to expected pDNA counts"),
     make_option(c("--cdna_output"), type = "character", help = "Path to save the cDNA counts for MPRAnalyze"),
-    make_option(c("--barcode_activity_output"), type = "character", help = "Path to save barcode-level activity used for barcode correlations")
+    make_option(c("--barcode_activity_output"), type = "character", help = "Path to save barcode-level activity used for barcode correlations"),
+    make_option(c("--viability_file"), type = "character", default = "", help = "Optional semicolon-separated viability matrix")
 )
 
 # Functions for the plots
@@ -107,14 +109,126 @@ corColors <- RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")[2:6]
 
 counts_df <- data.frame()
 
+normalize_well_id <- function(value) {
+    value <- toupper(trimws(as.character(value)))
+    value <- gsub("[^A-Z0-9]", "", value)
+    value
+}
+
+read_viability_matrix <- function(path) {
+    if (is.null(path) || !nzchar(trimws(path)) || !file.exists(path) || file.info(path)$size == 0) {
+        return(NULL)
+    }
+
+    viability_df <- tryCatch(
+        read.delim(path, sep = ";", header = TRUE, check.names = FALSE, quote = "", comment.char = "", na.strings = c("", "NA")),
+        error = function(e) data.frame()
+    )
+    if (is.null(viability_df) || ncol(viability_df) < 2) {
+        return(data.frame(well = character(0), viability = numeric(0)))
+    }
+
+    colnames(viability_df)[1] <- "well_row"
+    viability_long <- viability_df %>%
+        pivot_longer(-well_row, names_to = "well_column", values_to = "viability") %>%
+        mutate(
+            well_row = normalize_well_id(well_row),
+            well_column = normalize_well_id(well_column),
+            well = paste0(well_row, well_column),
+            viability = suppressWarnings(as.numeric(viability))
+        ) %>%
+        filter(well != "", !is.na(viability), is.finite(viability)) %>%
+        distinct(well, .keep_all = TRUE)
+
+    if (nrow(viability_long) == 0) {
+        return(data.frame(well = character(0), viability = numeric(0)))
+    }
+
+    viability_long
+}
+
+read_design_map <- function(path) {
+    if (is.null(path) || !nzchar(trimws(path)) || !file.exists(path) || file.info(path)$size == 0) {
+        return(NULL)
+    }
+
+    first_line <- tryCatch(readLines(path, n = 1, warn = FALSE), error = function(e) character(0))
+    if (length(first_line) == 0) {
+        return(NULL)
+    }
+
+    has_header <- grepl("sample|well|row|column|plate", tolower(first_line[1]))
+    design_df <- tryCatch(
+        read.csv(path, header = has_header, stringsAsFactors = FALSE, check.names = FALSE),
+        error = function(e) NULL
+    )
+    if (is.null(design_df) || ncol(design_df) < 2) {
+        return(NULL)
+    }
+
+    lower_names <- tolower(names(design_df))
+    well_col <- which(lower_names %in% c("well", "wells", "plate_well"))[1]
+    sample_col <- which(lower_names %in% c("sample", "condition", "name", "replicate"))[1]
+    row_col <- which(lower_names %in% c("row", "well_row"))[1]
+    column_col <- which(lower_names %in% c("column", "col", "well_column"))[1]
+
+    if (!is.na(well_col) && !is.na(sample_col)) {
+        return(
+            design_df %>%
+                transmute(
+                    sample = trimws(as.character(.data[[names(design_df)[sample_col]]])),
+                    well = normalize_well_id(.data[[names(design_df)[well_col]]])
+                ) %>%
+                filter(sample != "", well != "") %>%
+                distinct(sample, well, .keep_all = TRUE)
+        )
+    }
+
+    if (!is.na(row_col) && !is.na(column_col) && !is.na(sample_col)) {
+        return(
+            design_df %>%
+                transmute(
+                    sample = trimws(as.character(.data[[names(design_df)[sample_col]]])),
+                    well = normalize_well_id(paste0(.data[[names(design_df)[row_col]]], .data[[names(design_df)[column_col]]]))
+                ) %>%
+                filter(sample != "", well != "") %>%
+                distinct(sample, well, .keep_all = TRUE)
+        )
+    }
+
+    design_df <- design_df[, 1:2]
+    colnames(design_df) <- c("well", "sample")
+    design_df %>%
+        mutate(
+            sample = trimws(as.character(sample)),
+            well = normalize_well_id(well)
+        ) %>%
+        filter(sample != "", well != "") %>%
+        distinct(sample, well, .keep_all = TRUE)
+}
+
 ##########################################################################################
 ## Start of the script ###################################################################
 ##########################################################################################
 
 opt_parser <- OptionParser(option_list = option_list)
 opt <- parse_args(opt_parser)
-list_of_annotated_files = strsplit(opt$list_of_annotated_files, " ")[[1]]
-unique_files = unique(list_of_annotated_files)
+
+if (!is.null(opt$plots_basedir) && nzchar(opt$plots_basedir)) {
+    dir.create(opt$plots_basedir, recursive = TRUE, showWarnings = FALSE)
+}
+if (!is.null(opt$activity_basedir) && nzchar(opt$activity_basedir)) {
+    dir.create(opt$activity_basedir, recursive = TRUE, showWarnings = FALSE)
+}
+
+list_of_annotated_files <- if (file.exists(opt$list_of_annotated_files)) {
+    readLines(opt$list_of_annotated_files, warn = FALSE)
+} else {
+    strsplit(opt$list_of_annotated_files, "[[:space:],]+")[[1]]
+}
+list_of_annotated_files <- trimws(list_of_annotated_files)
+list_of_annotated_files <- list_of_annotated_files[list_of_annotated_files != ""]
+unique_files <- unique(list_of_annotated_files)
 
 counts_df = data.frame()
 for(l in unique_files){
@@ -128,22 +242,36 @@ for(l in unique_files){
     replicate = substr(sample_plus_replicate, underscore_pos + 1, nchar(sample_plus_replicate))
     this_replicate = paste(this_sample, replicate, sep = "_")
     this_replicate_df <- read.table(l, header = TRUE, sep = "\t")
+    count_col <- if ("count" %in% colnames(this_replicate_df)) {
+        "count"
+    } else if ("raw_count" %in% colnames(this_replicate_df)) {
+        "raw_count"
+    } else {
+        stop("Annotated file is missing a count column: ", l)
+    }
+    neg_ctrl_col <- if ("neg_ctrls" %in% colnames(this_replicate_df)) {
+        "neg_ctrls"
+    } else if ("negative_control" %in% colnames(this_replicate_df)) {
+        "negative_control"
+    } else {
+        stop("Annotated file is missing a negative-control column: ", l)
+    }
     # ADD PSEUDOCOUNT OF 1!!!!
-    this_replicate_df$count <- this_replicate_df$count + 1
+    this_replicate_df[[count_col]] <- as.numeric(this_replicate_df[[count_col]]) + 1
     is_pDNA = this_sample == "pDNA"
-    total_read_count = sum(this_replicate_df$count)
+    total_read_count = sum(this_replicate_df[[count_col]])
     this_df = data.frame(
         sample = this_sample,
         replicate = this_replicate,
         pDNA = is_pDNA,
         tf = this_replicate_df$tf,
-        negative_control = ifelse(this_replicate_df$neg_ctrls == "Yes", T, F),
+        negative_control = ifelse(this_replicate_df[[neg_ctrl_col]] == "Yes", T, F),
         promoter = this_replicate_df$promoter,
         barcode = this_replicate_df$barcode,
-        raw_count = this_replicate_df$count,
-        log2_count = log2(this_replicate_df$count),
+        raw_count = this_replicate_df[[count_col]],
+        log2_count = log2(this_replicate_df[[count_col]]),
         total_read_count=total_read_count,
-        RPM = this_replicate_df$count / total_read_count * 1e6
+        RPM = this_replicate_df[[count_col]] / total_read_count * 1e6
     )
     # ---- Update counts ---------------------------------------------------
     counts_df <- rbind(
@@ -304,6 +432,17 @@ bleed_through_slope_df <-
     ) %>%
     filter(negative_control)
 
+bleedthrough_output <- file.path(opt$activity_basedir, "bleedthrough_per_condition.txt")
+write.table(
+    bleed_through_slope_df %>%
+        select(sample, slope, intercept) %>%
+        distinct(),
+    file = bleedthrough_output,
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE
+)
+
 
 
 message("==== Plotting distribution of BC counts")
@@ -409,6 +548,88 @@ counts_df %>%
     )
 
 invisible(dev.off())
+
+viability_df <- read_viability_matrix(opt$viability_file)
+if (!is.null(viability_df)) {
+    viability_heatmap_df <- viability_df %>%
+        mutate(
+            row = factor(substr(well, 1, 1), levels = LETTERS[1:16]),
+            column = suppressWarnings(as.integer(sub("^[A-Za-z]+", "", well)))
+        ) %>%
+        filter(!is.na(column), !is.na(row)) %>%
+        complete(row, column = 1:24)
+
+    message("==== Plotting viability heatmap")
+    pdf(file.path(opt$plots_basedir, "viability_well_heatmap.pdf"), width = 12, height = 7)
+    print(
+        ggplot(viability_heatmap_df, aes(x = column, y = row, fill = viability)) +
+            geom_tile(color = "white", linewidth = 0.25) +
+            scale_x_continuous(breaks = 1:24, expand = c(0, 0)) +
+            scale_y_discrete(limits = rev(levels(viability_heatmap_df$row)), expand = c(0, 0)) +
+            scale_fill_gradientn(colors = viridisLite::viridis(256), na.value = "grey90") +
+            coord_fixed() +
+            theme_pubr(border = T) +
+            labs(
+                title = "Viability per well",
+                x = "Column",
+                y = "Row",
+                fill = "Viability"
+            ) +
+            theme(
+                panel.grid = element_blank(),
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+            )
+    )
+    invisible(dev.off())
+
+    design_map <- read_design_map(opt$design)
+
+    read_count_wells_df <- counts_df %>%
+        filter(!pDNA) %>%
+        group_by(sample) %>%
+        summarise(total_read_count = first(total_read_count), .groups = "drop") %>%
+        filter(total_read_count > 0)
+
+    if (!is.null(design_map)) {
+        read_count_wells_df <- read_count_wells_df %>%
+            inner_join(design_map, by = "sample") %>%
+            distinct(well, .keep_all = TRUE)
+        message("==== Viability design map rows: ", nrow(design_map))
+    } else {
+        read_count_wells_df <- read_count_wells_df %>%
+            mutate(well = normalize_well_id(sample)) %>%
+            filter(well != "") %>%
+            distinct(well, .keep_all = TRUE)
+        message("==== Viability design map unavailable; falling back to sample-derived wells")
+    }
+
+    viability_read_count_df <- read_count_wells_df %>%
+        inner_join(
+            viability_df %>% select(well, viability),
+            by = "well"
+        )
+    message("==== Viability overlaps: ", nrow(viability_read_count_df))
+    message("==== Plotting read count versus viability")
+    pdf(file.path(opt$plots_basedir, "read_counts_vs_viability.pdf"), width = 8, height = 6)
+    if (nrow(viability_read_count_df) >= 2) {
+        print(
+            ggplot(viability_read_count_df, aes(x = viability, y = total_read_count)) +
+                geom_point(alpha = 0.35, size = 1.4) +
+                geom_smooth(method = "lm", se = FALSE, color = "#4c78a8") +
+                stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
+                theme_pubr(border = T) +
+                labs(
+                    title = "Read counts versus viability",
+                    x = "Viability",
+                    y = "Total read count"
+                )
+        )
+    } else {
+        plot.new()
+        text(0.5, 0.5, "No overlapping wells found for viability plot")
+    }
+    invisible(dev.off())
+}
 
 # Plot correlation between cDNA and pDNA =======================================
 
@@ -549,6 +770,107 @@ if (!is.null(opt$barcode_activity_output)) {
         row.names = FALSE, quote = F, sep = "\t"
     )
 }
+
+activity_summary_df <- activity_df %>%
+    group_by(cDNA_sample, barcode, tf, negative_control, promoter) %>%
+    summarise(
+        mean_RPM = mean(activity_RPM),
+        log2_mean_RPM = log2(mean_RPM),
+        .groups = "drop"
+    )
+
+control_condition <-
+    all_cdna_conditions[str_detect(str_to_lower(all_cdna_conditions), "control|ctrl|dmso")][1]
+if (is.na(control_condition) || control_condition == "") {
+    control_condition <- all_cdna_conditions[1]
+}
+
+control_replicates <-
+    cdna_sample[str_detect(cdna_sample, paste0("^", control_condition, "_[0-9]+$"))]
+if (length(control_replicates) == 0) {
+    control_replicates <- cdna_sample[str_detect(str_to_lower(cdna_sample), "control|ctrl|dmso")]
+}
+if (length(control_replicates) == 0) {
+    control_replicates <- cdna_sample[1]
+}
+
+barcode_control_comparison_df <-
+    barcode_activity_df %>%
+    filter(!cDNA_sample %in% control_replicates) %>%
+    inner_join(
+        barcode_activity_df %>%
+            filter(cDNA_sample %in% control_replicates) %>%
+            group_by(barcode, tf, promoter) %>%
+            summarise(
+                control_mean_RPM = mean(mean_RPM),
+                control_log2_mean_RPM = log2(control_mean_RPM),
+                .groups = "drop"
+            ),
+        by = c("barcode", "tf", "promoter")
+    ) %>%
+    mutate(
+        comparison = cDNA_sample,
+        sample_log2_mean_RPM = log2_mean_RPM,
+        deviation = sample_log2_mean_RPM - control_log2_mean_RPM
+    )
+
+barcode_control_labels <-
+    barcode_control_comparison_df %>%
+    group_by(comparison, tf) %>%
+    slice_max(order_by = abs(deviation), n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    group_by(comparison) %>%
+    slice_max(order_by = abs(deviation), n = 5, with_ties = FALSE) %>%
+    ungroup()
+
+barcode_control_pages <- split(
+    sort(unique(barcode_control_comparison_df$comparison)),
+    ceiling(seq_along(sort(unique(barcode_control_comparison_df$comparison))) / 25)
+)
+
+message("==== Plotting barcode activities vs control")
+pdf(file.path(opt$plots_basedir, "control_barcode_correlations.pdf"), width = 16, height = 16)
+for (page_idx in seq_along(barcode_control_pages)) {
+    page_comparisons <- barcode_control_pages[[page_idx]]
+    page_df <- barcode_control_comparison_df %>%
+        filter(comparison %in% page_comparisons) %>%
+        mutate(comparison = factor(comparison, levels = page_comparisons))
+    page_labels <- barcode_control_labels %>%
+        filter(comparison %in% page_comparisons) %>%
+        filter(control_log2_mean_RPM > -2 | sample_log2_mean_RPM > -2) %>%
+        mutate(comparison = factor(comparison, levels = page_comparisons))
+
+    if (nrow(page_df) == 0) {
+        next
+    }
+
+    p <- ggplot(page_df, aes(x = control_log2_mean_RPM, y = sample_log2_mean_RPM)) +
+        geom_point(alpha = 0.25, size = 0.7) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+        geom_text_repel(
+            data = page_labels,
+            aes(label = tf),
+            size = 4,
+            max.overlaps = Inf,
+            min.segment.length = 0,
+            box.padding = 0.05,
+            point.padding = 0.05,
+            segment.color = "grey50"
+        ) +
+        facet_wrap(~comparison, ncol = 5) +
+        coord_equal() +
+        theme_pubr(border = T) +
+        ggtitle(paste0("Barcode activities vs ", control_condition, " control (page ", page_idx, "/", length(barcode_control_pages), ")")) +
+        xlab(paste0(control_condition, " control barcode activity (log2 mean RPM)")) +
+        ylab("Sample barcode activity (log2 mean RPM)") +
+        theme(
+            text = element_text(size = 14),
+            strip.text = element_text(size = 8, face = "bold"),
+            axis.text = element_text(size = 7)
+        )
+    print(p)
+}
+invisible(dev.off())
 
 ################################ PLOT REPLICATE CORRELATIONS #############################
 

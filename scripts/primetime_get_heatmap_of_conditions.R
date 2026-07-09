@@ -1,121 +1,197 @@
 suppressPackageStartupMessages({
     library(tidyverse)
-    library(ggthemes)
-    library(ggnewscale)
     library(optparse)
-    library(forcats)
     library(ggplot2)
+    library(ggthemes)
     library(reshape2)
-    library(ggtext)
+    library(pheatmap)
 })
 
-# Read the arguments:
 option_list <- list(
-    make_option(c("--results"), type = "character", help = "Results file from PrimeTime"),
+    make_option(c("--results"), type = "character", help = "Comma-separated list of results files"),
+    make_option(c("--results-file"), type = "character", help = "File containing newline-separated results files"),
     make_option(c("--output"), type = "character", help = "Output file")
 )
 
 opt_parser <- OptionParser(option_list = option_list)
 opt <- parse_args(opt_parser)
 
-cat("DEBUG: opt$results =", opt$results, "\n")
-
-# Construct the df
-all_comparisons_df = data.frame()
-all_comparisons_randoms = data.frame()
-for(this_comparison in opt$results %>% strsplit(split=",") %>% unlist) {
-    cat("DEBUG: Processing file:", this_comparison, "\n")
-    tmp = basename(this_comparison) %>% str_remove(".txt") %>% strsplit(split="_vs_") %>% unlist
-    comparison_name = sprintf("**%s** vs. %s", tmp[1], tmp[2])
-    cat("DEBUG: Comparison name:", comparison_name, "\n")
-    read_table(this_comparison) %>%
-        select(tf, sig, logFC) %>%
-        mutate(comparison = comparison_name) -> tmp_df
-    cat("DEBUG: tmp_df nrow =", nrow(tmp_df), "\n")
-    cat("DEBUG: sig values unique:", paste(unique(tmp_df$sig), collapse=", "), "\n")
-    randoms = tmp_df %>% filter(grepl("RANDOM", tf))
-    not_randoms = tmp_df %>% filter(!grepl("RANDOM", tf))
-    cat("DEBUG: randoms nrow =", nrow(randoms), ", not_randoms nrow =", nrow(not_randoms), "\n")
-    all_comparisons_df = rbind(all_comparisons_df, not_randoms)
-    all_comparisons_randoms = rbind(all_comparisons_randoms, randoms)
+# Be tolerant to optparse naming differences for --results-file.
+results_file_opt <- opt$results_file
+if (is.null(results_file_opt) && !is.null(opt$results.file)) {
+    results_file_opt <- opt$results.file
+}
+if (is.null(results_file_opt) && !is.null(opt$`results-file`)) {
+    results_file_opt <- opt$`results-file`
 }
 
-cat("DEBUG: all_comparisons_df total nrow =", nrow(all_comparisons_df), "\n")
-cat("DEBUG: all_comparisons_df head:\n")
-print(head(all_comparisons_df))
+if (is.null(opt$output) || (is.null(opt$results) && is.null(results_file_opt))) {
+    stop("Missing required arguments")
+}
 
-# Cluster the comparisons based on the logFC values
-filtered_for_clustering <- all_comparisons_df %>%
-    filter(sig != 'NS') %>%
-    select(-sig)
-cat("DEBUG: Rows after filtering sig != 'NS':", nrow(filtered_for_clustering), "\n")
-cat("DEBUG: Unique comparisons:", paste(unique(filtered_for_clustering$comparison), collapse=", "), "\n")
+result_files <- character(0)
+if (!is.null(opt$results)) {
+    result_files <- c(result_files, unlist(strsplit(opt$results, ",")))
+}
+if (!is.null(results_file_opt)) {
+    filelist_lines <- readLines(results_file_opt, warn = FALSE)
+    # Support both newline-separated and whitespace-separated path lists.
+    filelist_tokens <- unlist(strsplit(paste(filelist_lines, collapse = "\n"), "[[:space:]]+"))
+    result_files <- c(result_files, filelist_tokens)
+}
+result_files <- unique(trimws(result_files))
+result_files <- result_files[result_files != ""]
 
-filtered_for_clustering %>%
-    pivot_wider(names_from = comparison, values_from = logFC, values_fill = 0) %>%
-    column_to_rownames(var = "tf") %>%
-    t() %>%
-    scale() %>%
-    dist() %>%
-    hclust(method = "ward.D2") %>%
-    as.dendrogram() %>%
-    labels() -> comparison_order
-cat("DEBUG: comparison_order length:", length(comparison_order), "\n")
+all_comparisons_df <- data.frame()
+processed_files <- 0L
 
-# Cluster the TFs based on the logFC values
-all_comparisons_df %>%
-    filter(sig != 'NS') %>%
-    select(-sig) %>%
-    pivot_wider(names_from = tf, values_from = logFC, values_fill = 0) %>%
-    column_to_rownames(var = "comparison") %>%
-    t() %>%
-    dist() %>%
-    hclust(method = "ward.D2") %>%
-    as.dendrogram() %>%
-    labels() -> tf_order
+extract_comparison_parts <- function(file_base) {
+    vs_pos <- regexpr("_vs_", file_base, fixed = TRUE)[1]
+    if (vs_pos <= 0) {
+        return(NULL)
+    }
+    contrast <- substr(file_base, 1, vs_pos - 1)
+    reference <- substr(file_base, vs_pos + 4, nchar(file_base))
+    if (contrast == "" || reference == "") {
+        return(NULL)
+    }
+    list(contrast = contrast, reference = reference)
+}
 
+for (this_comparison in result_files) {
+    if (!file.exists(this_comparison) || file.info(this_comparison)$size == 0) {
+        next
+    }
 
-# Reorder the comparisons based on the clustering
-all_comparisons_df %>%
-    mutate(comparison = factor(comparison, levels = comparison_order)) %>%
-    mutate(tf = factor(tf, levels = tf_order)) -> plot_df
+    file_base <- sub("\\.txt$", "", basename(this_comparison))
+    comparison_parts <- extract_comparison_parts(file_base)
+    if (is.null(comparison_parts)) {
+        next
+    }
 
-# Plot the heatmap
-up = plot_df %>% filter(sig=='Upregulated')
-down = plot_df %>% filter(sig=='Downregulated')
+    comparison_df <- suppressWarnings(read.table(this_comparison, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE))
 
-cat("DEBUG: up nrow =", nrow(up), "\n")
-cat("DEBUG: down nrow =", nrow(down), "\n")
-cat("DEBUG: plot_df before NA filter nrow =", nrow(plot_df), "\n")
+    if (!all(c("tf", "logFC") %in% colnames(comparison_df))) {
+        next
+    }
 
-# Filter NA plot_Df
-plot_df %>%
-    filter(!is.na(comparison)) %>%
-    filter(!is.na(tf)) -> plot_df
+    new_df <- comparison_df %>%
+        select(tf, logFC, any_of("sig")) %>%
+        mutate(
+            logFC = as.numeric(logFC),
+            sig = if ("sig" %in% colnames(.)) as.character(sig) else "NS",
+            condition_raw = comparison_parts$contrast,
+            reference_condition = comparison_parts$reference,
+            comparison = paste0(comparison_parts$contrast, " vs ", comparison_parts$reference)
+        ) %>%
+        filter(!grepl("^RANDOM", tf)) %>%
+        as.data.frame()
 
-cat("DEBUG: plot_df after NA filter nrow =", nrow(plot_df), "\n")
-cat("DEBUG: plot_df after NA filter head:\n")
-print(head(plot_df))
+    all_comparisons_df <- bind_rows(all_comparisons_df, new_df)
+    processed_files <- processed_files + 1L
+}
 
-pdf(opt$output, width=16, height=8)
-ggplot(plot_df, aes(x = tf, y = comparison)) +
-    geom_tile(fill = "white", color = NA) +
-    geom_tile(data = up, aes(fill = logFC), size = 0.1, color = NA) +
-    scale_fill_distiller(palette = "Reds", name = "LogFC\n(Upregulated)", direction = 1) +
-    ggnewscale::new_scale_fill() +
-    theme_few() +
-    geom_tile(data = down, aes(fill = logFC), size = 0.1, color = NA) +
-    scale_fill_distiller(palette = "Blues", name = "LogFC\n(Downregulated)") +
-    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
-    labs(
-        title = "TF Activity Changes Across Comparisons",
-        x = "",
-        y = ""
-    ) +
-    theme(
-        axis.text.x = element_text(size = 6),
-        axis.text.y = element_markdown(size = 8),
-        plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
-    ) +
-    coord_fixed(ratio = 1)
+if (nrow(all_comparisons_df) == 0) {
+    message("Heatmap: processed 0 comparison files with usable fold-change columns out of ", length(result_files), " listed files")
+    pdf(opt$output, width = 8, height = 4)
+    plot.new()
+    text(0.5, 0.5, "No comparable conditions found")
+    invisible(dev.off())
+    quit(status = 0)
+}
+
+message("Heatmap: processed ", processed_files, " comparison files with usable fold-change columns")
+
+# Use plain condition names if each condition maps to one reference, otherwise use full comparison labels.
+condition_ref_count <- all_comparisons_df %>%
+    distinct(condition_raw, reference_condition) %>%
+    count(condition_raw, name = "n_refs")
+
+all_comparisons_df <- all_comparisons_df %>%
+    left_join(condition_ref_count, by = "condition_raw") %>%
+    mutate(condition = ifelse(n_refs > 1, comparison, condition_raw))
+
+heatmap_wide <- all_comparisons_df %>%
+    group_by(condition, tf) %>%
+    summarise(logFC = mean(logFC, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = tf, values_from = logFC, values_fill = 0)
+
+sig_wide <- all_comparisons_df %>%
+    group_by(condition, tf) %>%
+    summarise(is_sig = any(sig != "NS", na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = tf, values_from = is_sig, values_fill = FALSE)
+
+if (nrow(heatmap_wide) == 0 || ncol(heatmap_wide) <= 1) {
+    pdf(opt$output, width = 8, height = 4)
+    plot.new()
+    text(0.5, 0.5, "No fold-change values available for heatmap")
+    invisible(dev.off())
+    quit(status = 0)
+}
+
+matrix_values <- as.matrix(heatmap_wide %>% select(-condition))
+rownames(matrix_values) <- heatmap_wide$condition
+sig_matrix <- as.matrix(sig_wide %>% select(-condition))
+rownames(sig_matrix) <- sig_wide$condition
+
+# Ensure there are no NA/NaN values for pheatmap.
+matrix_values[is.na(matrix_values)] <- 0
+
+# Drop rows/columns with zero variance to avoid clustering artifacts.
+if (nrow(matrix_values) > 1) {
+    row_keep <- apply(matrix_values, 1, function(x) sd(x) > 0)
+    if (any(row_keep)) {
+        matrix_values <- matrix_values[row_keep, , drop = FALSE]
+        sig_matrix <- sig_matrix[row_keep, , drop = FALSE]
+    }
+}
+if (ncol(matrix_values) > 1) {
+    col_keep <- apply(matrix_values, 2, function(x) sd(x) > 0)
+    if (any(col_keep)) {
+        matrix_values <- matrix_values[, col_keep, drop = FALSE]
+        sig_matrix <- sig_matrix[, col_keep, drop = FALSE]
+    }
+}
+
+if (nrow(matrix_values) == 0 || ncol(matrix_values) == 0) {
+    pdf(opt$output, width = 8, height = 4)
+    plot.new()
+    text(0.5, 0.5, "No variable fold-change values available for heatmap")
+    invisible(dev.off())
+    quit(status = 0)
+}
+
+matrix_plot <- matrix_values
+matrix_plot[!sig_matrix] <- NA_real_
+
+# Compute dendrograms from the zero-filled matrix to avoid NA issues in hclust.
+row_cluster <- FALSE
+col_cluster <- FALSE
+if (nrow(matrix_values) >= 2) {
+    row_cluster <- hclust(dist(matrix_values), method = "ward.D2")
+}
+if (ncol(matrix_values) >= 2) {
+    col_cluster <- hclust(dist(t(matrix_values)), method = "ward.D2")
+}
+
+pdf(
+    opt$output,
+    width = max(10, min(40, 4 + 0.16 * ncol(matrix_values))),
+    height = max(6, min(30, 3 + 0.45 * nrow(matrix_values)))
+)
+pheatmap(
+    matrix_plot,
+    cluster_rows = row_cluster,
+    cluster_cols = col_cluster,
+    border_color = NA,
+    color = colorRampPalette(c("#6495ed", "white", "#f37f80"))(100),
+    breaks = seq(-1, 1, length.out = 101),
+    na_col = "#eeedf1",
+    main = "TF Fold-Change Heatmap Across Conditions",
+    cellwidth = 6,
+    cellheight = 6,
+    fontsize_row = 6,
+    fontsize_col = 6,
+    angle_col = 90
+)
 invisible(dev.off())
