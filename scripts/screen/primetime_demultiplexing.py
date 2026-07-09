@@ -323,18 +323,12 @@ def get_barcode_counts(fastq_r2,
         for s, c in loc_sample_counts.items():
             sample_counts[s] = sample_counts.get(s, 0) + c
 
-    batch_size = 20000
+    batch_size = 50000
     futures = []
     executor = ThreadPoolExecutor(max_workers=num_cores) if num_cores and num_cores > 1 else None
 
-    # Count total reads for progress bar (quick grep on gzipped file)
-    sys.stderr.write(f"Counting total reads in {fastq_r2}...\n")
-    total_reads_expected = count_reads_in_fastq(fastq_r2)
-    if total_reads_expected:
-        sys.stderr.write(f"Processing {total_reads_expected:,} reads total\n")
-    else:
-        sys.stderr.write("Could not determine total read count; progress bar will not show ETA\n")
-        total_reads_expected = None
+    # Skip a second pass over the FASTQ just for ETA estimation.
+    total_reads_expected = None
 
     try:
         with gzip.open(fastq_r2, "rt") as h2, gzip.open(fastq_r1, "rt") as h1:

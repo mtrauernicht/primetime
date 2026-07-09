@@ -58,12 +58,25 @@ option_list <- list(
 opt_parser <- OptionParser(option_list = option_list)
 opt <- parse_args(opt_parser)
 
+find_existing_path <- function(paths) {
+        for (candidate in paths) {
+                if (!is.na(candidate) && file.exists(candidate)) {
+                        return(candidate)
+                }
+        }
+        return(NA_character_)
+}
+
+script_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
+script_path <- if (length(script_arg) > 0) sub("^--file=", "", script_arg[1]) else getwd()
+project_root <- dirname(dirname(normalizePath(script_path)))
+
 
 ##########################################################################################
 # Preparing the data #####################################################################
 ##########################################################################################
 
-pdna <- read.table(opt$pdna, header = TRUE, sep = "\t")
+pdna <- read.table(opt$pdna, header = TRUE, sep = "\t", check.names = FALSE)
 name_of_the_pdna_replicate <- colnames(pdna) %>% setdiff(c("barcode", "negative_control"))
 
 contrast_condition <- opt$contrast_condition
@@ -75,7 +88,7 @@ logfc_threshold <- if (normalize_counts) 0.263 else 0
 ref_replicates = paste0(reference_condition, "_", 1:opt$num_replicates_reference)
 contrast_replicates = paste0(contrast_condition, "_", 1:opt$num_replicates_contrast)
 
-cdna <- read.table(opt$cdna, header = TRUE, sep = "\t") %>%
+cdna <- read.table(opt$cdna, header = TRUE, sep = "\t", check.names = FALSE) %>%
         select(
                 tf,
                 negative_control,
@@ -100,6 +113,27 @@ design_df <- data.frame(
 output_pdf_name <- paste0(contrast_condition, "_vs_", reference_condition, ".pdf")
 output_txt_name <- paste0(contrast_condition, "_vs_", reference_condition, ".txt")
 p_threshold <- opt$pval_threshold
+
+dir.create(file.path(opt$plot_output, "volcano_plots"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(opt$plot_output, "lollipop_plots"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(opt$plot_output, "circular_lollipop_plots"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(opt$plot_output, "output_data"), showWarnings = FALSE, recursive = TRUE)
+
+tf_function_path <- find_existing_path(c(
+        file.path(project_root, "misc", "tf_functions.tsv"),
+        file.path(dirname(opt$plot_output), "misc", "tf_functions.tsv"),
+        file.path(dirname(dirname(opt$plot_output)), "misc", "tf_functions.tsv")
+))
+tf_function_map <- NULL
+tf_function_order <- character(0)
+if (!is.na(tf_function_path) && file.exists(tf_function_path)) {
+        tf_function_map <- read.table(tf_function_path, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+        if ("biological_function" %in% colnames(tf_function_map)) {
+                tf_function_order <- unique(tf_function_map$biological_function)
+        }
+} else {
+        warning("Could not find tf_functions.tsv - circular plot will fall back to alphabetical TF ordering")
+}
 
 df <-
         merge(pdna, cdna %>% select(-negative_control), by = "barcode") %>%
@@ -519,6 +553,138 @@ plot_df %>%
                 x = "",
                                 title= paste(contrast_condition, "vs.", reference_condition)
             )
+invisible(dev.off())
+
+pdf(file.path(opt$plot_output, "circular_lollipop_plots/", output_pdf_name), width = 14, height = 14)
+
+circular_plot_df <-
+        all_results %>%
+        filter(!grepl("RANDOM", tf)) %>%
+        left_join(
+                if (!is.null(tf_function_map)) {
+                        tf_function_map %>% select(tf, biological_function)
+                } else {
+                        data.frame(tf = character(0), biological_function = character(0))
+                },
+                by = "tf"
+        ) %>%
+        mutate(
+                biological_function = ifelse(is.na(biological_function), "Unknown", biological_function),
+                biological_function = factor(
+                        biological_function,
+                        levels = c(tf_function_order, setdiff("Unknown", tf_function_order))
+                )
+        ) %>%
+        arrange(biological_function, tf) %>%
+        distinct(tf, .keep_all = TRUE) %>%
+        mutate(
+                tf = factor(tf, levels = unique(tf)),
+                color_axis = ifelse(sig == "Upregulated", "#f37f80",
+                                    ifelse(sig == "NS", "gray30", "#6495ed"))
+        )
+
+if (nrow(circular_plot_df) > 0) {
+                activity_limits <- range(
+                        circular_plot_df$logFC,
+                        na.rm = TRUE
+                )
+                base_radius <- abs(min(activity_limits, na.rm = TRUE)) + 1
+                lower_fold_limit <- if (activity_limits[1] < -4) activity_limits[1] - 1 else -4
+                upper_fold_limit <- if (activity_limits[2] > 4) activity_limits[2] + 1 else 4
+                y_breaks <- seq(lower_fold_limit, upper_fold_limit, by = 1)
+                circular_plot_df <- circular_plot_df %>%
+                        mutate(
+                                fold_change_radius = base_radius + logFC,
+                                x_index = row_number(),
+                                y_axis_label = "Fold change (log2)",
+                                sig_group = cumsum(c(TRUE, sig[-1] != sig[-n()]))
+                        )
+
+                ribbon_polygons <- do.call(
+                        rbind,
+                        lapply(seq_len(nrow(circular_plot_df)), function(index) {
+                                current_row <- circular_plot_df[index, ]
+                                next_index <- if (index == nrow(circular_plot_df)) 1 else index + 1
+                                next_row <- circular_plot_df[next_index, ]
+                                segment_fill <- if (current_row$sig != "NS") current_row$sig else next_row$sig
+                                data.frame(
+                                        polygon_id = index,
+                                        fill_group = segment_fill,
+                                        x = c(
+                                                current_row$x_index,
+                                                next_row$x_index,
+                                                next_row$x_index,
+                                                current_row$x_index
+                                        ),
+                                        y = c(
+                                                current_row$fold_change_radius,
+                                                next_row$fold_change_radius,
+                                                base_radius,
+                                                base_radius
+                                        )
+                                )
+                        })
+                )
+
+                line_plot_df <- circular_plot_df %>%
+                        select(x_index, fold_change_radius, sig) %>%
+                        bind_rows(tibble(
+                                x_index = max(circular_plot_df$x_index) + 1,
+                                fold_change_radius = circular_plot_df$fold_change_radius[1],
+                                sig = circular_plot_df$sig[1]
+                        ))
+
+                leader_line_df <- circular_plot_df %>%
+                        mutate(label_radius = base_radius + upper_fold_limit + 1.15)
+
+                label_df <- circular_plot_df %>%
+                        mutate(
+                                label_radius = base_radius + upper_fold_limit + 1.15,
+                                label_angle_raw = 90 - 360 * (x_index - 0.5) / nrow(circular_plot_df),
+                                label_angle = ifelse(label_angle_raw < -90, label_angle_raw + 180, label_angle_raw),
+                                label_hjust = ifelse(label_angle_raw < -90, 1, 0)
+                        )
+
+        p_circular <- circular_plot_df %>%
+                ggplot() +
+                                geom_polygon(data = ribbon_polygons, aes(x = x, y = y, fill = fill_group, group = polygon_id), alpha = 0.35) +
+                                geom_segment(data = leader_line_df, aes(x = x_index, xend = x_index, y = fold_change_radius, yend = label_radius), color = "grey85", linewidth = 0.3) +
+                                geom_line(data = line_plot_df, color = "grey60", aes(x = x_index, y = fold_change_radius, group = 1), size = 1) +
+                                geom_point(aes(x = x_index, y = fold_change_radius, fill = sig),
+                                           shape = 21, color = "grey30", size = 3) +
+                                geom_text(data = label_df, aes(x = x_index, y = label_radius, label = tf, angle = label_angle, hjust = label_hjust), size = 2.3, color = "grey30", vjust = 0.5) +
+                scale_fill_manual(values = c("NS" = "grey80", "Downregulated" = "#6495ed", "Upregulated" = "#f37f80")) +
+                                guides(fill = "none") +
+                                scale_x_continuous(
+                                        breaks = circular_plot_df$x_index,
+                                        limits = c(0.5, max(circular_plot_df$x_index) + 0.5),
+                                        expand = expansion(mult = c(0, 0))
+                                ) +
+                                scale_y_continuous(
+                                        limits = c(base_radius + lower_fold_limit, base_radius + upper_fold_limit + 1.3),
+                                        breaks = base_radius + y_breaks,
+                                        labels = y_breaks,
+                                        expand = expansion(mult = c(0, 0))
+                                ) +
+                coord_polar(theta = "x") +
+                theme_bw() +
+                theme(
+                        axis.text.x = element_blank(),
+                        panel.grid.major.x = element_blank(),
+                        panel.grid.minor.x = element_blank(),
+                        panel.grid.major.y = element_blank(),
+                        panel.grid.minor.y = element_blank(),
+                        text = element_text(size = 14)
+                ) +
+                labs(
+                                        y = "Fold change (log2)",
+                        x = "",
+                                        title = paste(contrast_condition, "vs.", reference_condition, "(circular fold-change)")
+                )
+
+        print(p_circular)
+}
+
 invisible(dev.off())
 
 all_results %>%
