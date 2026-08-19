@@ -13,16 +13,16 @@ ESR1	Steroid/thyroid/vitamin hormone signaling
 PGR	Steroid/thyroid/vitamin hormone signaling
 THRA	Steroid/thyroid/vitamin hormone signaling
 THRB	Steroid/thyroid/vitamin hormone signaling
-VDR	Steroid/thyroid/vitamin hormone signaling
+VDR::RXRA	Steroid/thyroid/vitamin hormone signaling
 NR3C1	Corticosteroid stress hormone signaling
 NR3C2	Corticosteroid stress hormone signaling
 RARA	Retinoid signaling
-RARA::RXRA	Retinoid signaling
+RARA:RXRA	Retinoid signaling
 RXRA	Retinoid signaling
-PPARA	Lipid/sterol/bile acid metabolic sensing
-PPARG	Lipid/sterol/bile acid metabolic sensing
+PPARA::RXRA	Lipid/sterol/bile acid metabolic sensing
+PPARG::RXRA	Lipid/sterol/bile acid metabolic sensing
 NR1H2	Lipid/sterol/bile acid metabolic sensing
-NR1H4	Lipid/sterol/bile acid metabolic sensing
+NR1H4::RXRA	Lipid/sterol/bile acid metabolic sensing
 NR1I2	Xenobiotic/toxin detoxification response
 NR1I3	Xenobiotic/toxin detoxification response
 AHR::ARNT	Xenobiotic/toxin detoxification response
@@ -32,7 +32,7 @@ REL	Immune/inflammatory activation (NF-κB & NFAT)
 NFATC1	Immune/inflammatory activation (NF-κB & NFAT)
 NFAT5	Immune/inflammatory activation (NF-κB & NFAT)
 STAT1	Cytokine/interferon-JAK-STAT signaling
-STAT1::2	Cytokine/interferon-JAK-STAT signaling
+STAT1::STAT2	Cytokine/interferon-JAK-STAT signaling
 STAT3	Cytokine/interferon-JAK-STAT signaling
 STAT4	Cytokine/interferon-JAK-STAT signaling
 STAT6	Cytokine/interferon-JAK-STAT signaling
@@ -49,14 +49,15 @@ MYC	Cell cycle progression/proliferation
 MYBL2	Cell cycle progression/proliferation
 FOS::JUN	AP-1/MAPK immediate-early growth response
 FOSL1	AP-1/MAPK immediate-early growth response
-ELK1	AP-1/MAPK immediate-early growth response
+ELK1_A	AP-1/MAPK immediate-early growth response
+ELK1_B	AP-1/MAPK immediate-early growth response
 EGR1	AP-1/MAPK immediate-early growth response
 SRF	AP-1/MAPK immediate-early growth response
 ATF2	AP-1/MAPK immediate-early growth response
 CREB1	AP-1/MAPK immediate-early growth response
 TEAD1	Hippo/YAP growth control
 TP53	DNA damage response/tumor suppression
-SMAD2::3::4	TGF-β/BMP/Notch developmental signaling
+SMAD2::SMAD3::SMAD4	TGF-β/BMP/Notch developmental signaling
 SMAD4	TGF-β/BMP/Notch developmental signaling
 RBPJ	TGF-β/BMP/Notch developmental signaling
 TCF7	Wnt signaling
@@ -84,7 +85,7 @@ GRHL1	Epithelial/epidermal & neural crest development
 TFAP2A	Epithelial/epidermal & neural crest development
 FOXO1	Stress-responsive metabolic/apoptotic signaling
 NR4A1	Stress-responsive metabolic/apoptotic signaling
-NR4A2	Stress-responsive metabolic/apoptotic signaling
+NR4A2::RXRA	Stress-responsive metabolic/apoptotic signaling
 CLOCK	Circadian rhythm regulation
 NR1D1	Circadian rhythm regulation
 HIF1A	Hypoxia adaptive response
