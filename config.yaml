@@ -1,46 +1,25 @@
 ################################################################################
 # Primetime: TF reporter pipeline
 # Vinícius H. Franceschini-Santos, Max Trauernicht 
-# =============================================================================
-# ============================ Config file  ===================================
-# =============================================================================
-
-#==============================================================================
-INPUT_DATA:
-  U2OS_control:
-    is_pdna: False
-    condition: DMSO
-    fastq: 
-      - test_data/U2OS_DMSO_1.fastq.gz
-      - test_data/U2OS_DMSO_3.fastq.gz
-
-  U2OS_calcitriol:
-    is_pdna: False
-    condition: Calcitriol
-    fastq: 
-      - test_data/U2OS_calcitriol_1.fastq.gz
-      - test_data/U2OS_calcitriol_2.fastq.gz
-      - test_data/U2OS_calcitriol_3.fastq.gz
-
-  pDNA:
-    is_pdna: True
-    condition: None
-    fastq: 
-      - test_data/pDNA_1.fastq.gz
-      - test_data/pDNA_2.fastq.gz
 # ==============================================================================
-COMPARATIVE_ANALYSIS:
-  REFERENCE_CONDITION: DMSO
-  CONTRAST_CONDITION: Calcitriol
+# ============================ Config file  ====================================
+# ==============================================================================
 
-# =============================================================================
-OUTPUT_DIRECTORY: test_data_output_control_13
-NORMALIZE_COUNTS: True
+#===============================================================================
+# ============================= Input and Output ===============================
+COMPARISONS_FILE: /DATA/shared/projects/TF_REPORTERS/prime_TF_reporters/E2951_indiv_HCT_test/mt20260707_comparisons.txt
+SAMPLES_FILE: /DATA/shared/projects/TF_REPORTERS/prime_TF_reporters/E2951_indiv_HCT_test/mt20260707_conditions_to_file.txt
+OUTPUT_DIRECTORY: /DATA/shared/projects/TF_REPORTERS/prime_TF_reporters/E2951_indiv_HCT_test/001_OUTPUT
 
 
 # ==============================================================================
 # ============================ Pipeline parameters =============================
 PVALUE_THRESHOLD: 0.01
+
+SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER: False
+
+NORMALIZE_COUNTS: True
+
 
 
 # ==============================================================================
@@ -52,13 +31,13 @@ BARCODES_PER_TF: 5
 BARCODE_LENGTH: 12
 
 # BC downstream sequence: this will be used to identify the barcodes in the fastq files
-BARCODE_DOWNSTREAM_SEQUENCE: CATCGTCGCATCCAAGAGGCTAGCTAACTA 
+BARCODE_DOWNSTREAM_SEQUENCE: CATCGTCGCATCCAAGAGGC 
 
 # How many mismatches are allowed in the downstream sequence to identify the barcode?
 MAX_MISMATCH_DOWNSTREAM_SEQ: 3
 
 # Path to the barcode annotation file
-BARCODE_ANNOTATION_FILE: misc/bc_annotation_prime_v1.csv
+BARCODE_ANNOTATION_FILE: /DATA/pipelines/primetime/misc/bc_annotation_prime_v2.csv
 
 # Path to expected pDNA counts, to compare with as a QC
-EXPECTED_PDNA_COUNTS: misc/expected_pDNA_counts.txt
+EXPECTED_PDNA_COUNTS: /DATA/pipelines/primetime/misc/expected_pDNA_counts.txt
