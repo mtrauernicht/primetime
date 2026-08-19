@@ -25,6 +25,23 @@ SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER: False
 
 NORMALIZE_COUNTS: True
 
+# Set to False to skip demultiplexing and reuse existing demultiplexed FASTQ files
+# from DEMULTIPLEX_DIRECTORY.
+RUN_DEMULTIPLEXING: True
+
+# Optional: point to a previous run output directory (or directly to its tmp_primetime
+# directory) to reuse RT barcode clustering files and skip re-running
+# extract_rt_barcodes/cluster_rt_barcodes.
+# Examples:
+# PREVIOUS_TMP_PRIMETIME_DIR: /path/to/old_run_output
+# PREVIOUS_TMP_PRIMETIME_DIR: /path/to/old_run_output/tmp_primetime
+PREVIOUS_TMP_PRIMETIME_DIR: ""
+
+# Optional: when True, read annotated barcode files directly from
+# PREVIOUS_TMP_PRIMETIME_DIR/tmp_primetime/bc_counts and skip recomputing
+# get_barcode_counts/cluster_barcodes/annotate_barcodes.
+REUSE_PREVIOUS_BC_COUNTS: False
+
 # ==============================================================================
 # ============================ Library parameters ==============================
 # Number of barcodes per TF
@@ -40,6 +57,9 @@ RT_BARCODE_UPSTREAM_SEQUENCE: CATCGTCGCATCCAAGAGGC
 # How many mismatches are allowed in the downstream sequence to identify the barcode?
 MAX_MISMATCH_DOWNSTREAM_SEQ: 3
 
+
+# ==============================================================================
+# ============================ Other input files ===============================
 # Path to the barcode annotation file
 BARCODE_ANNOTATION_FILE: /DATA/pipelines/primetime/misc/bc_annotation_prime_v2.csv
 
@@ -49,5 +69,5 @@ EXPECTED_PDNA_COUNTS: /DATA/pipelines/primetime/misc/expected_pDNA_counts.txt
 # Path to RT barcode to well mapping file
 RT_BARCODE_MAPPING_FILE: /DATA/pipelines/primetime/misc/rt_barcode.csv
 
-# Optional semicolon-separated viability matrix; leave empty to skip the QC plot
+# Optional viability matrix file or list of files, in plate order; leave empty to skip the QC plots
 VIABILITY_FILE: ""
