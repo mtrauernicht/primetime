@@ -1,3 +1,4 @@
 .snakemake
+create_envs.log
 test_data_output*
 scripts/deprecated*
