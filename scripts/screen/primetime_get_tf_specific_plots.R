@@ -21,7 +21,11 @@ opt <- list(
     barcode_dir = get_arg("--barcode-dir"),
     reference_condition = get_arg("--reference-condition"),
     well_map = get_arg("--well-map"),
-    output_dir = get_arg("--output-dir")
+    output_dir = get_arg("--output-dir"),
+    # Fast replicate plotting mode is always enabled automatically.
+    replicate_include_violins = TRUE,
+    replicate_multi_tf_pages = FALSE,
+    replicate_tfs_per_page = 6L
 )
 
 # Validate inputs
@@ -105,7 +109,34 @@ infer_condition_from_replicate <- function(x) {
 
 # Load well map (maps well position -> sample name)
 message("Loading well map...")
-well_map_data <- read.csv(opt$well_map, header = FALSE, stringsAsFactors = FALSE, col.names = c("well", "sample"))
+well_map_data <- tryCatch({
+    fread(opt$well_map, header = FALSE, fill = TRUE, data.table = FALSE)
+}, error = function(e) {
+    stop("Failed to read well map file '", opt$well_map, "': ", e$message)
+})
+
+if (ncol(well_map_data) < 2) {
+    stop("Well map file must contain at least two columns: well,sample. File: ", opt$well_map)
+}
+
+if (ncol(well_map_data) > 2) {
+    message("Well map has ", ncol(well_map_data), " columns; using only the first two (well,sample).")
+}
+
+well_map_data <- well_map_data[, 1:2, drop = FALSE]
+colnames(well_map_data) <- c("well", "sample")
+
+# If a header line is present in a no-header file, drop it.
+if (nrow(well_map_data) > 0 &&
+    tolower(trimws(well_map_data$well[1])) == "well" &&
+    tolower(trimws(well_map_data$sample[1])) == "sample") {
+    well_map_data <- well_map_data[-1, , drop = FALSE]
+}
+
+well_map_data$well <- trimws(as.character(well_map_data$well))
+well_map_data$sample <- trimws(as.character(well_map_data$sample))
+well_map_data <- well_map_data[well_map_data$well != "" & well_map_data$sample != "", , drop = FALSE]
+
 well_map <- setNames(well_map_data$sample, well_map_data$well)
 
 # Load barcode annotation files
@@ -333,6 +364,144 @@ resolve_target_condition <- function(comp_parts, reference_condition) {
     comp_parts[1]
 }
 
+create_tf_condition_lollipop <- function(tf_name, tf_results, reference_condition, max_conditions = 100L) {
+    if (is.null(tf_results) || nrow(tf_results) == 0 || !"comparison_id" %in% colnames(tf_results) || !"logFC" %in% colnames(tf_results)) {
+        return(NULL)
+    }
+
+    tf_plot_df <- tf_results
+    tf_plot_df$target_condition <- vapply(
+        strsplit(as.character(tf_plot_df$comparison_id), "_vs_", fixed = TRUE),
+        function(parts) resolve_target_condition(parts, reference_condition),
+        character(1)
+    )
+    tf_plot_df$logFC_numeric <- suppressWarnings(as.numeric(tf_plot_df$logFC))
+
+    tf_plot_df <- tf_plot_df %>%
+        filter(!is.na(target_condition), target_condition != "", is.finite(logFC_numeric)) %>%
+        mutate(
+            abs_logFC = abs(logFC_numeric),
+            sig = ifelse(is.na(sig), "NS", as.character(sig)),
+            sig = ifelse(sig %in% c("Upregulated", "Downregulated", "NS"), sig, "NS")
+        )
+
+    if (nrow(tf_plot_df) == 0) {
+        return(NULL)
+    }
+
+    tf_plot_df <- tf_plot_df %>%
+        arrange(desc(abs_logFC)) %>%
+        group_by(target_condition) %>%
+        slice_head(n = 1) %>%
+        ungroup()
+
+    if (nrow(tf_plot_df) > max_conditions) {
+        tf_plot_df <- tf_plot_df %>%
+            arrange(desc(abs_logFC)) %>%
+            slice_head(n = max_conditions)
+    }
+
+    tf_plot_df <- tf_plot_df %>%
+        arrange(desc(logFC_numeric)) %>%
+        mutate(target_condition = factor(target_condition, levels = target_condition))
+
+    ggplot(tf_plot_df, aes(x = target_condition, y = logFC_numeric)) +
+        geom_segment(aes(xend = target_condition, y = 0, yend = logFC_numeric, color = sig), size = 0.9) +
+        geom_point(aes(color = sig), size = 2.7) +
+        scale_color_manual(
+            values = c("NS" = "grey", "Downregulated" = "#6495ed", "Upregulated" = "#f37f80"),
+            name = "Comparative\nanalysis"
+        ) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.4) +
+        theme_bw() +
+        theme(
+            axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+            panel.grid.major.x = element_blank(),
+            panel.grid.minor.x = element_blank(),
+            legend.position = "bottom"
+        ) +
+        labs(
+            title = paste0("Condition-level fold changes: ", tf_name),
+            subtitle = paste0("Top ", min(max_conditions, nrow(tf_plot_df)), " by absolute logFC, ordered high to low"),
+            x = "Condition",
+            y = "log2 Fold Change"
+        )
+}
+
+# Vectorized replacement for the old per-condition resolve_condition_sign() calls.
+# Builds a condition_key -> sign lookup table for an entire TF in one pass over
+# that TF's comparison rows, instead of re-scanning all rows once per condition
+# (which was O(TFs x conditions x comparisons) before).
+build_condition_sign_lookup <- function(tf_results, reference_keys) {
+    empty <- setNames(character(0), character(0))
+    if (is.null(tf_results) || nrow(tf_results) == 0 || !"comparison_id" %in% colnames(tf_results)) {
+        return(empty)
+    }
+
+    parts_list <- strsplit(as.character(tf_results$comparison_id), "_vs_", fixed = TRUE)
+    ok <- lengths(parts_list) == 2
+    if (!any(ok)) return(empty)
+
+    parts_mat <- do.call(rbind, parts_list[ok])
+    key1 <- normalize_label(parts_mat[, 1])
+    key2 <- normalize_label(parts_mat[, 2])
+
+    is_ref1 <- key1 %in% reference_keys
+    is_ref2 <- key2 %in% reference_keys
+    # condition_key is whichever side of the comparison is NOT the reference;
+    # rows where both or neither side match the reference are dropped (mirrors
+    # the original resolve_condition_sign(), which required exactly one match).
+    cond_key <- ifelse(is_ref1 & !is_ref2, key2, ifelse(is_ref2 & !is_ref1, key1, NA_character_))
+
+    rows <- tf_results[ok, , drop = FALSE]
+    rows$cond_key <- cond_key
+    rows <- rows[!is.na(rows$cond_key), , drop = FALSE]
+    if (nrow(rows) == 0 || !"sig" %in% colnames(rows)) return(empty)
+
+    # Tie-break the same way the original did: strongest |logFC| wins per condition.
+    rows$logFC_abs <- if ("logFC" %in% colnames(rows)) abs(suppressWarnings(as.numeric(rows$logFC))) else NA_real_
+    rows <- rows[order(-rows$logFC_abs), , drop = FALSE]
+    rows <- rows[!duplicated(rows$cond_key), , drop = FALSE]
+
+    sig_vals <- as.character(rows$sig)
+    sig_vals[is.na(sig_vals)] <- "NS"
+    sig_vals[!sig_vals %in% c("NS", "Downregulated", "Upregulated", "Control condition")] <- "Unknown"
+
+    setNames(sig_vals, rows$cond_key)
+}
+
+build_replicate_plot <- function(plot_df, title_text, include_violins) {
+    color_map <- c(
+        "Control condition" = "#000000",
+        "NS" = "grey",
+        "Downregulated" = "#6495ed",
+        "Upregulated" = "#f37f80",
+        "Unknown" = "grey"
+    )
+    fill_map <- c(
+        "Control condition" = "#00000033",
+        "NS" = "#e4e4e455",
+        "Downregulated" = "#6495ed33",
+        "Upregulated" = "#f37f8033",
+        "Unknown" = "#e4e4e455"
+    )
+
+    p_rep <- ggplot(plot_df, aes(x = replicate, y = activity_log2)) +
+        geom_point(aes(color = treatment_col), alpha = 0.8, size = 1.0, position = position_jitter(width = 0.15, height = 0)) +
+        scale_color_manual(values = color_map) +
+        labs(title = title_text, x = "Replicate", y = "Log2(cDNA/pDNA)") +
+        theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+    if (include_violins) {
+        p_rep <- p_rep +
+            ggplot2::geom_boxplot(aes(fill = treatment_col), alpha = 0.3, outlier.size = 0.5) +
+            scale_fill_manual(values = fill_map)
+    }
+
+    p_rep
+}
+
 # Function to create 384-well plate visualization for a TF
 create_plate_overview <- function(tf_name, all_results, barcode_list, well_mapping, design_data) {
     rows <- LETTERS[1:16]
@@ -352,6 +521,7 @@ create_plate_overview <- function(tf_name, all_results, barcode_list, well_mappi
     qc_score_hits <- 0
 
     plate_matrix <- matrix(NA_real_, nrow = length(rows), ncol = length(cols), dimnames = list(rows, as.character(cols)))
+    avg_fc_matrix <- matrix(NA_real_, nrow = length(rows), ncol = length(cols), dimnames = list(rows, as.character(cols)))
     tooltip_matrix <- matrix("", nrow = length(rows), ncol = length(cols), dimnames = list(rows, as.character(cols)))
     sample_matrix <- matrix(NA_character_, nrow = length(rows), ncol = length(cols), dimnames = list(rows, as.character(cols)))
     condition_matrix <- matrix(NA_character_, nrow = length(rows), ncol = length(cols), dimnames = list(rows, as.character(cols)))
@@ -407,6 +577,36 @@ create_plate_overview <- function(tf_name, all_results, barcode_list, well_mappi
             "<br>Sample: ", well_meta$sample[well_idx],
             "<br>Condition: ", well_meta$condition[well_idx]
         )
+    }
+
+    # Build condition-level average fold-change (all comparisons, irrespective of significance).
+    tf_results$target_condition <- vapply(
+        strsplit(as.character(tf_results$comparison_id), "_vs_", fixed = TRUE),
+        function(parts) resolve_target_condition(parts, opt$reference_condition),
+        character(1)
+    )
+    tf_results$logFC_numeric <- suppressWarnings(as.numeric(tf_results$logFC))
+
+    avg_fc_by_condition <- tf_results %>%
+        filter(!is.na(target_condition), target_condition != "", is.finite(logFC_numeric)) %>%
+        group_by(target_condition) %>%
+        summarise(avg_logFC = mean(logFC_numeric, na.rm = TRUE), .groups = "drop")
+
+    if (nrow(avg_fc_by_condition) > 0) {
+        avg_fc_lookup <- setNames(avg_fc_by_condition$avg_logFC, normalize_label(avg_fc_by_condition$target_condition))
+        for (well_idx in seq_len(nrow(well_meta))) {
+            well <- well_meta$well[well_idx]
+            coords <- well_to_coords(well)
+            if (is.na(coords$row) || is.na(coords$col)) {
+                next
+            }
+            cond_key <- normalize_label(well_meta$condition[well_idx])
+            avg_fc_value <- unname(avg_fc_lookup[cond_key])
+            if (length(avg_fc_value) == 0) {
+                avg_fc_value <- NA_real_
+            }
+            avg_fc_matrix[coords$row, coords$col] <- avg_fc_value
+        }
     }
 
     for (comp_idx in seq_len(nrow(tf_results))) {
@@ -471,6 +671,7 @@ create_plate_overview <- function(tf_name, all_results, barcode_list, well_mappi
     plate_df$condition <- mapply(function(r, c) condition_matrix[r, as.character(c)], as.character(plate_df$Row), plate_df$Col)
     plate_df$tooltip <- mapply(function(r, c) tooltip_matrix[r, as.character(c)], as.character(plate_df$Row), plate_df$Col)
     plate_df$logFC_display <- ifelse(is.na(plate_df$logFC), NA, ifelse(plate_df$sig %in% c("Upregulated", "Downregulated"), plate_df$logFC, 0))
+    plate_df$avg_logFC <- mapply(function(r, c) avg_fc_matrix[r, as.character(c)], as.character(plate_df$Row), plate_df$Col)
 
     plate_title <- paste0("384-Well Plate Overview: ", tf_name)
 
@@ -495,7 +696,30 @@ create_plate_overview <- function(tf_name, all_results, barcode_list, well_mappi
             plot.title = element_text(size = 11, face = "bold"),
             legend.position = "bottom"
         )
-    static_plot
+
+    avg_plot <- ggplot(plate_df, aes(x = Col, y = Row, fill = avg_logFC)) +
+        geom_tile(color = "white", size = 0.2) +
+        scale_fill_gradient2(
+            low = "#377EB8", mid = "white", high = "#E41A1C",
+            limits = c(-2, 2),
+            oob = scales::squish,
+            na.value = "#F0F0F0", breaks = scales::pretty_breaks(n = 5)
+        ) +
+        scale_x_continuous(breaks = cols, expand = c(0, 0)) +
+        scale_y_discrete(expand = c(0, 0)) +
+        coord_fixed() +
+        labs(
+            title = paste0("384-Well Plate Overview (Average logFC, all comparisons): ", tf_name),
+            x = "Column", y = "Row", fill = "Average\nlogFC"
+        ) +
+        theme_minimal() +
+        theme(
+            axis.text = element_text(size = 7),
+            plot.title = element_text(size = 11, face = "bold"),
+            legend.position = "bottom"
+        )
+
+    list(sig_plot = static_plot, avg_plot = avg_plot)
 }
 
 # Precompute replicate plotting dataset once (major speedup vs rebuilding per TF)
@@ -609,7 +833,7 @@ if (!is.null(cdna_df)) {
     }
 }
 
-# Process each TF
+# Process each TF (plate overviews first)
 message("Generating plots for each TF...")
 plot_count <- 0
 
@@ -617,15 +841,14 @@ for (tf in all_tfs) {
     tryCatch({
         tf_results <- all_results[all_results$tf == tf, , drop = FALSE]
 
-        # Create plate overview
         plate_plots <- create_plate_overview(tf, all_results, all_barcodes, well_map, design)
 
         if (!is.null(plate_plots)) {
             output_file <- file.path(opt$output_dir, paste0(tf, "_plate_overview.pdf"))
 
-            # Save a static PDF only
             pdf(output_file, width = 12, height = 8, useDingbats = FALSE)
-            print(plate_plots)
+            print(plate_plots$sig_plot)
+            print(plate_plots$avg_plot)
             dev.off()
 
             message("  ✓ ", tf, " - plate overview")
@@ -634,84 +857,162 @@ for (tf in all_tfs) {
             message("  - ", tf, " - no plate data")
         }
 
-        # Generate per-TF replicate comparison plot if precomputed replicate data is available
-        if (!is.null(replicate_by_tf)) {
-            tf_df <- replicate_by_tf[[tf]]
-            if (!is.null(tf_df) && nrow(tf_df) > 0) {
-                ref_key <- "dmso"
-                ref_key_upper <- "DMSO"
-
-                other_conditions <- unique(tf_df$condition[tf_df$condition_key != ref_key_upper & !is.na(tf_df$condition_key)])
-                if (length(other_conditions) > 0) {
-                    out_file <- file.path(opt$output_dir, paste0(tf, "_replicates.pdf"))
-                    pdf(out_file, width = 8, height = 6, useDingbats = FALSE)
-
-                    for (condition_name in other_conditions) {
-                        plot_df <- tf_df[tf_df$condition_key %in% c(ref_key_upper, toupper(condition_name)), ]
-                        if (nrow(plot_df) == 0) {
-                            next
-                        }
-
-                        cond_key <- normalize_label(condition_name)
-
-                        comp_matches <- vapply(tf_results$comparison_id, function(cid) {
-                            parts <- strsplit(as.character(cid), "_vs_", fixed = TRUE)[[1]]
-                            if (length(parts) != 2) {
-                                return(FALSE)
-                            }
-                            part_keys <- vapply(parts, normalize_label, character(1))
-                            has_condition <- cond_key %in% part_keys
-                            has_reference <- any(part_keys %in% c(ref_key, "dmso", "control", "ctrl"))
-                            has_condition && has_reference
-                        }, logical(1))
-
-                        sign <- "NS"
-                        if (any(comp_matches, na.rm = TRUE)) {
-                            candidate_rows <- tf_results[comp_matches, , drop = FALSE]
-                            if ("logFC" %in% colnames(candidate_rows)) {
-                                candidate_rows$logFC_abs <- abs(as.numeric(candidate_rows$logFC))
-                                candidate_rows <- candidate_rows[order(candidate_rows$logFC_abs, decreasing = TRUE), , drop = FALSE]
-                            }
-                            candidate_sig <- as.character(candidate_rows$sig)
-                            candidate_sig <- candidate_sig[!is.na(candidate_sig)]
-                            if (length(candidate_sig) > 0) {
-                                sign <- candidate_sig[1]
-                            }
-                        }
-
-                        if (!sign %in% c("NS", "Downregulated", "Upregulated", "Control condition")) {
-                            sign <- "Unknown"
-                        }
-
-                        plot_df$treatment_col <- ifelse(plot_df$condition_key == ref_key_upper, "Control condition", sign)
-
-
-                        p_rep <- ggplot(plot_df, aes(x = replicate, y = activity_log2)) +
-                            geom_point(aes(color = treatment_col)) +
-                            scale_color_manual(values = c("Control condition" = "#000000", "NS" = "grey", "Downregulated" = "#6495ed", "Upregulated" = "#f37f80", "Unknown" = "grey")) +
-                            labs(title = paste0("Replicate activity: ", tf, " - ", condition_name), x = "Replicate", y = "Log2(cDNA/pDNA)") +
-                            theme_bw() +
-                            theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
-
-                        # Add violin layer if treatment_col exists
-                        p_rep <- p_rep + ggplot2::geom_violin(aes(fill = treatment_col, color = treatment_col), alpha = 0.4, width = 1) +
-                            scale_fill_manual(values = c("Control condition" = "#00000033", "NS" = "#e4e4e455", "Downregulated" = "#6495ed33", "Upregulated" = "#f37f8033", "Unknown" = "#e4e4e455"))
-
-                        print(p_rep)
-                    }
-
-                    dev.off()
-                    message("  ✓ ", tf, " - replicate plot")
-                    plot_count <- plot_count + 1
-                }
-            }
+        # Per-TF condition lollipop plot based on comparative-analysis fold changes
+        lollipop_plot <- create_tf_condition_lollipop(
+            tf_name = tf,
+            tf_results = tf_results,
+            reference_condition = opt$reference_condition,
+            max_conditions = 100L
+        )
+        if (!is.null(lollipop_plot)) {
+            lollipop_file <- file.path(opt$output_dir, paste0(tf, "_condition_lollipop.pdf"))
+            pdf(lollipop_file, width = 16, height = 7, useDingbats = FALSE)
+            print(lollipop_plot)
+            dev.off()
+            message("  ✓ ", tf, " - condition lollipop")
+            plot_count <- plot_count + 1
+        } else {
+            message("  - ", tf, " - no lollipop data")
         }
     }, error = function(e) {
         message("  ✗ ", tf, " - Error: ", e$message)
     })
 }
 
+# Build replicate plotting table once, then render in either per-TF or multi-TF mode.
+if (!is.null(replicate_by_tf)) {
+    reference_keys <- c("dmso", "control", "ctrl")
+    tf_results_by_tf <- split(all_results, all_results$tf)
+    replicate_chunks <- vector("list", length(all_tfs))
+    chunk_idx <- 0L
+
+    for (tf in all_tfs) {
+        tf_df <- replicate_by_tf[[tf]]
+        tf_results <- tf_results_by_tf[[tf]]
+
+        if (is.null(tf_df) || nrow(tf_df) == 0 || is.null(tf_results) || nrow(tf_results) == 0) {
+            next
+        }
+
+        ref_key_upper <- "DMSO"
+        other_conditions <- unique(tf_df$condition[tf_df$condition_key != ref_key_upper & !is.na(tf_df$condition_key)])
+        if (length(other_conditions) == 0) {
+            next
+        }
+
+        # Sign lookup and condition split are built ONCE per TF here, instead of
+        # being recomputed from scratch inside the loop below for every one of
+        # its ~300 conditions (that repeated re-scan was the main bottleneck).
+        sign_lookup <- build_condition_sign_lookup(tf_results, reference_keys)
+        tf_df_by_cond <- split(tf_df, tf_df$condition_key)
+        ref_rows <- tf_df_by_cond[[ref_key_upper]]
+
+        for (condition_name in other_conditions) {
+            cond_rows <- tf_df_by_cond[[toupper(condition_name)]]
+            plot_df <- rbind(ref_rows, cond_rows)
+            if (is.null(plot_df) || nrow(plot_df) == 0) {
+                next
+            }
+
+            sign <- unname(sign_lookup[normalize_label(condition_name)])
+            if (length(sign) == 0 || is.na(sign)) {
+                sign <- "NS"
+            }
+            plot_df$treatment_col <- ifelse(plot_df$condition_key == ref_key_upper, "Control condition", sign)
+            plot_df$tf <- tf
+            plot_df$condition <- condition_name
+
+            chunk_idx <- chunk_idx + 1L
+            replicate_chunks[[chunk_idx]] <- plot_df
+        }
+    }
+
+    replicate_chunks <- Filter(Negate(is.null), replicate_chunks)
+    if (length(replicate_chunks) > 0) {
+        replicate_plot_df <- do.call(rbind, replicate_chunks)
+
+        if (isTRUE(opt$replicate_multi_tf_pages)) {
+            replicate_plot_df$panel_id <- paste(replicate_plot_df$tf, replicate_plot_df$condition, sep = " | ")
+            unique_panels <- unique(as.character(replicate_plot_df$panel_id))
+            split_idx <- split(seq_along(unique_panels), ceiling(seq_along(unique_panels) / opt$replicate_tfs_per_page))
+            out_file <- file.path(opt$output_dir, "all_tfs_replicates.pdf")
+
+            pdf(out_file, width = 15, height = 10, useDingbats = FALSE)
+            for (page_indices in split_idx) {
+                panel_page <- unique_panels[page_indices]
+                page_df <- replicate_plot_df[replicate_plot_df$panel_id %in% panel_page, , drop = FALSE]
+                page_df$panel_id <- factor(page_df$panel_id, levels = panel_page)
+
+                page_plot <- build_replicate_plot(
+                    page_df,
+                    title_text = "Replicate activity across TFs",
+                    include_violins = isTRUE(opt$replicate_include_violins)
+                ) +
+                    facet_wrap(~panel_id, scales = "free_y", ncol = 2) +
+                    theme(legend.position = "bottom")
+
+                print(page_plot)
+            }
+            dev.off()
+
+            message("  ✓ Combined replicate pages saved to: ", out_file)
+            plot_count <- plot_count + 1
+        } else {
+            for (tf in unique(as.character(replicate_plot_df$tf))) {
+                tf_plot_df <- replicate_plot_df[replicate_plot_df$tf == tf, , drop = FALSE]
+                if (nrow(tf_plot_df) == 0) {
+                    next
+                }
+
+                unique_conditions <- unique(as.character(tf_plot_df$condition))
+                condition_pages <- split(
+                    seq_along(unique_conditions),
+                    ceiling(seq_along(unique_conditions) / opt$replicate_tfs_per_page)
+                )
+
+                out_file <- file.path(opt$output_dir, paste0(tf, "_replicates.pdf"))
+                pdf(out_file, width = 10, height = 7, useDingbats = FALSE)
+
+                for (page_idx in seq_along(condition_pages)) {
+                    page_conditions <- unique_conditions[condition_pages[[page_idx]]]
+                    page_df <- tf_plot_df[tf_plot_df$condition %in% page_conditions, , drop = FALSE]
+                    page_df$condition <- factor(page_df$condition, levels = page_conditions)
+
+                    # Control rows are intentionally duplicated once per condition during
+                    # assembly; remove those duplicates before plotting combined pages.
+                    control_mask <- !is.na(page_df$treatment_col) & page_df$treatment_col == "Control condition"
+                    if (any(control_mask)) {
+                        control_df <- page_df[control_mask, , drop = FALSE]
+                        non_control_df <- page_df[!control_mask, , drop = FALSE]
+                        dedupe_cols <- intersect(
+                            c("tf", "barcode", "replicate", "cDNA_sample", "activity_log2", "condition_key", "treatment_col"),
+                            colnames(control_df)
+                        )
+                        if (length(dedupe_cols) == 0) {
+                            dedupe_cols <- setdiff(colnames(control_df), "condition")
+                        }
+                        control_df <- control_df[!duplicated(control_df[, dedupe_cols, drop = FALSE]), , drop = FALSE]
+                        page_df <- rbind(control_df, non_control_df)
+                    }
+
+                    tf_plot <- build_replicate_plot(
+                        page_df,
+                        title_text = paste0("Replicate activity: ", tf, " (page ", page_idx, ")"),
+                        include_violins = isTRUE(opt$replicate_include_violins)
+                    ) +
+                        #facet_wrap(~condition, scales = "free_y", ncol = 3) +
+                        theme(legend.position = "none")
+
+                    print(tf_plot)
+                }
+                dev.off()
+
+                message("  ✓ ", tf, " - replicate plot")
+                plot_count <- plot_count + 1
+            }
+        }
+    }
+}
+
 message("")
 message("Generated ", plot_count, " plots in: ", opt$output_dir)
-
-

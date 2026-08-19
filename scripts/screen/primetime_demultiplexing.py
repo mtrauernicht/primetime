@@ -1,7 +1,7 @@
 # ==============================================================================
 # Prime Time: TF reporter pipeline
 # Vinícius H. Franceschini-Santos, Max Trauernicht 2026-01-13
-# Version 0.1
+# Version 0.2
 # ==============================================================================
 # Description:
 #
@@ -36,17 +36,28 @@
 # ==============================================================================
 # Versions:
 # 0.1 - Initial version
+# 0.2 - Performance fixes:
+#         * Dropped regex.BESTMATCH: it forces an exhaustive search for the
+#           optimal fuzzy match rather than stopping at the first match within
+#           the allowed error count, and was the dominant per-read cost.
+#         * Switched batch processing from ThreadPoolExecutor to
+#           ProcessPoolExecutor: the per-batch work is CPU-bound (regex +
+#           string ops), so threads were serialized by the GIL and --threads
+#           > 1 wasn't buying real parallelism before.
+#         * Replaced Biopython SeqIO parsing/formatting with manual 4-line
+#           FASTQ parsing, avoiding SeqRecord construction/formatting
+#           overhead per read.
 # ==============================================================================
 
 import regex
-from Bio import SeqIO
+from Bio.Seq import Seq
 import argparse
 import sys
 import gzip
 import os
 import re
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
 # ==============================================================================
@@ -65,7 +76,7 @@ def parse_arguments():
     parser.add_argument("--bc_length", type=int, required=True, help="Length of barcode to extract after the upstream sequence")
     parser.add_argument("--rt_bc_upstream_seq", type=str, required=True, help="Sequence upstream of barcode")
     parser.add_argument("--max_mismatch", type=int, default=0, help="Maximum number of mismatches allowed when matching upstream sequence")
-    parser.add_argument("--threads", type=int, default=1, help="Number of threads to use (currently unused, single-threaded processing)")
+    parser.add_argument("--threads", type=int, default=1, help="Number of worker processes to use for parallel batch processing")
 
     parser.add_argument("--invalid_bc_file", type=str, default=None, help="Optional output file for invalid barcodes and unmapped reads")
     parser.add_argument("--rt_barcode_map", type=str, required=True, help="CSV file mapping RT barcodes to well IDs (columns: well,barcode)")
@@ -109,6 +120,25 @@ def count_reads_in_fastq(fastq_gz_path):
         sys.stderr.write(f"Warning: could not count reads in {fastq_gz_path}: {e}\n")
     return None
 
+
+def fastq_records(fh):
+    """Yield (header, seq, plus, qual) 4-line tuples from an open FASTQ text handle.
+
+    Each element still includes its trailing newline, so the four lines can be
+    concatenated directly for output without any reformatting (unlike
+    Biopython's SeqRecord.format(), which re-serializes the record).
+    """
+    while True:
+        header = fh.readline()
+        if not header:
+            return
+        seq = fh.readline()
+        plus = fh.readline()
+        qual = fh.readline()
+        if not qual:
+            return  # truncated/incomplete final record
+        yield header, seq, plus, qual
+
 # ==============================================================================
 # Demultiplex and write per-well read1 files
 # ==============================================================================
@@ -117,7 +147,6 @@ def build_barcode_map(mapping_file):
     """Read the RT barcode mapping CSV (columns: well,barcode) and return
     a dict barcode -> well."""
     import csv
-    from Bio.Seq import Seq
 
     mapping = {}
     with open(mapping_file, "r", encoding="utf-8-sig") as fh:
@@ -147,6 +176,78 @@ def build_well_to_sample_map(samples_file):
                 if well and sample:
                     mapping[well] = sample
     return mapping
+
+
+# ------------------------------------------------------------------------------
+# Module-level worker state for ProcessPoolExecutor
+# ------------------------------------------------------------------------------
+# process_batch is defined at module level (rather than nested inside
+# get_barcode_counts, as it was before) so it can be pickled and sent to
+# worker processes. _init_worker populates _worker_state once per worker
+# process (and once in the main process, for the single-process fallback
+# path where no executor is used) so the regex pattern and lookup dicts
+# don't need to be re-sent with every batch.
+_worker_state = {}
+
+
+def _init_worker(regex_pattern, bc_length, barcode_to_well, well_to_sample, cluster_map):
+    _worker_state["compiled_pattern"] = regex.compile(regex_pattern)
+    _worker_state["bc_length"] = bc_length
+    _worker_state["barcode_to_well"] = barcode_to_well
+    _worker_state["well_to_sample"] = well_to_sample
+    _worker_state["cluster_map"] = cluster_map
+
+
+def process_batch(batch):
+    """Process a batch of records. batch is list of (seq2, read_id, r1_fastq_str)."""
+    compiled_pattern = _worker_state["compiled_pattern"]
+    bc_length = _worker_state["bc_length"]
+    barcode_to_well = _worker_state["barcode_to_well"]
+    well_to_sample = _worker_state["well_to_sample"]
+    cluster_map = _worker_state["cluster_map"]
+
+    local_matched_valid = 0
+    local_matched_invalid = 0
+    local_mismatched = 0
+    local_invalids = []
+    local_well_reads = {}
+    local_barcode_ids = []
+    local_well_counts = {}
+    local_sample_counts = {}
+
+    for seq, read_id, r1_fastq in batch:
+        match = compiled_pattern.search(seq)
+        if match is None:
+            local_mismatched += 1
+            continue
+
+        start_bc = match.span()[1]
+        barcode = seq[start_bc:start_bc + bc_length]
+        # correct barcode via cluster centroid if available
+        if cluster_map:
+            barcode = cluster_map.get(barcode, barcode)
+
+        well = barcode_to_well.get(barcode)
+        if not well:
+            local_matched_invalid += 1
+            local_invalids.append((barcode, read_id))
+            continue
+
+        sample = well_to_sample.get(well)
+        if not sample:
+            local_matched_invalid += 1
+            local_invalids.append((barcode, read_id))
+            continue
+
+        local_matched_valid += 1
+        local_well_reads.setdefault(well, []).append(r1_fastq)
+        local_well_counts[well] = local_well_counts.get(well, 0) + 1
+        local_sample_counts[sample] = local_sample_counts.get(sample, 0) + 1
+        local_barcode_ids.append((barcode, read_id))
+
+    return (local_matched_valid, local_matched_invalid, local_mismatched,
+            local_invalids, local_well_reads, local_barcode_ids,
+            local_well_counts, local_sample_counts)
 
 
 def get_barcode_counts(fastq_r2,
@@ -194,7 +295,6 @@ def get_barcode_counts(fastq_r2,
             raise FileNotFoundError("pDNA plate specified but source pDNA fastq not found")
 
     regex_pattern = build_regexp_pattern(rt_bc_upstream_seq, max_mismatch)
-    compiled_pattern = regex.compile(regex_pattern, regex.BESTMATCH)
 
     barcode_to_well = build_barcode_map(rt_barcode_map_file)
     well_to_sample = build_well_to_sample_map(samples_file)
@@ -220,6 +320,10 @@ def get_barcode_counts(fastq_r2,
                             cluster_map[m] = centroid
         except Exception as e:
             sys.stderr.write(f"Warning: failed to parse cluster file {rt_cluster_file}: {e}\n")
+
+    # Populate worker state in the main process too, so the single-process
+    # fallback path (num_cores <= 1) can call process_batch directly.
+    _init_worker(regex_pattern, bc_length, barcode_to_well, well_to_sample, cluster_map)
 
     matched_but_invalid = 0
     matched_and_valid = 0
@@ -248,52 +352,6 @@ def get_barcode_counts(fastq_r2,
     if barcode_ids_file:
         barcode_ids_fh = open(barcode_ids_file, "w")
         barcode_ids_fh.write("barcode\tread_id\n")
-
-    def process_batch(batch):
-        """Process a batch of records. batch is list of (seq2, read_id, r1_fastq_str)."""
-        local_matched_valid = 0
-        local_matched_invalid = 0
-        local_mismatched = 0
-        local_invalids = []
-        local_well_reads = {}
-        local_barcode_ids = []
-        local_well_counts = {}
-        local_sample_counts = {}
-
-        for seq, read_id, r1_fastq in batch:
-            match = compiled_pattern.search(seq)
-            if match is None:
-                local_mismatched += 1
-                continue
-
-            start_bc = match.span()[1]
-            barcode = seq[start_bc:start_bc + bc_length]
-            # correct barcode via cluster centroid if available
-            if cluster_map:
-                barcode = cluster_map.get(barcode, barcode)
-
-            well = barcode_to_well.get(barcode)
-            if not well:
-                local_matched_invalid += 1
-                local_invalids.append((barcode, read_id))
-                continue
-
-            sample = well_to_sample.get(well)
-            if not sample:
-                local_matched_invalid += 1
-                local_invalids.append((barcode, read_id))
-                continue
-
-            local_matched_valid += 1
-            local_well_reads.setdefault(well, []).append(r1_fastq)
-            local_well_counts[well] = local_well_counts.get(well, 0) + 1
-            local_sample_counts[sample] = local_sample_counts.get(sample, 0) + 1
-            if barcode_ids_fh:
-                local_barcode_ids.append((barcode, read_id))
-
-        return (local_matched_valid, local_matched_invalid, local_mismatched,
-                local_invalids, local_well_reads, local_barcode_ids,
-                local_well_counts, local_sample_counts)
 
     def handle_result(result):
         nonlocal matched_and_valid, matched_but_invalid, mismatched, total_reads
@@ -325,22 +383,28 @@ def get_barcode_counts(fastq_r2,
 
     batch_size = 50000
     futures = []
-    executor = ThreadPoolExecutor(max_workers=num_cores) if num_cores and num_cores > 1 else None
+    executor = ProcessPoolExecutor(
+        max_workers=num_cores,
+        initializer=_init_worker,
+        initargs=(regex_pattern, bc_length, barcode_to_well, well_to_sample, cluster_map),
+    ) if num_cores and num_cores > 1 else None
 
     # Skip a second pass over the FASTQ just for ETA estimation.
     total_reads_expected = None
 
     try:
         with gzip.open(fastq_r2, "rt") as h2, gzip.open(fastq_r1, "rt") as h1:
-            iter2 = SeqIO.parse(h2, "fastq")
-            iter1 = SeqIO.parse(h1, "fastq")
+            iter2 = fastq_records(h2)
+            iter1 = fastq_records(h1)
 
             batch = []
             pbar = tqdm(total=total_reads_expected, desc=f"Demultiplexing {plate_id if plate_id else 'reads'}", unit=" reads", unit_scale=True)
-            for rec2, rec1 in zip(iter2, iter1):
+            for (header2, seq2, plus2, qual2), (header1, seq1, plus1, qual1) in zip(iter2, iter1):
                 total_reads += 1
                 pbar.update(1)
-                batch.append((str(rec2.seq), rec2.id, rec1.format("fastq")))
+                read_id = header2[1:].split()[0]
+                r1_fastq = header1 + seq1 + plus1 + qual1
+                batch.append((seq2.rstrip("\n"), read_id, r1_fastq))
                 if len(batch) >= batch_size:
                     if executor:
                         futures.append(executor.submit(process_batch, batch))

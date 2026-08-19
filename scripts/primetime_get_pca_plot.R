@@ -108,6 +108,20 @@ compute_umap_coords <- function(input_matrix, labels, python_exe) {
   coords
 }
 
+select_spread_labels <- function(coords_df, x_col, y_col, label_col, min_labels = 10, frac_labels = 0.6, max_labels = 60) {
+  coords_df$display_label <- ""
+  if (nrow(coords_df) == 0) {
+    return(coords_df)
+  }
+  centroid_x <- mean(coords_df[[x_col]], na.rm = TRUE)
+  centroid_y <- mean(coords_df[[y_col]], na.rm = TRUE)
+  distances <- sqrt((coords_df[[x_col]] - centroid_x)^2 + (coords_df[[y_col]] - centroid_y)^2)
+  n_to_label <- min(nrow(coords_df), max(min_labels, ceiling(nrow(coords_df) * frac_labels), na.rm = TRUE), max_labels)
+  top_idx <- order(distances, decreasing = TRUE)[seq_len(n_to_label)]
+  coords_df$display_label[top_idx] <- as.character(coords_df[[label_col]][top_idx])
+  coords_df
+}
+
 for (this_file in result_files) {
   if (!file.exists(this_file) || file.info(this_file)$size == 0) {
     next
@@ -155,86 +169,6 @@ for (this_file in result_files) {
 
 plots_to_print <- list()
 
-if (nrow(condition_activity_df) > 0) {
-  condition_activity_df <- condition_activity_df %>%
-    group_by(condition, tf) %>%
-    summarise(activity = mean(activity, na.rm = TRUE), .groups = "drop")
-
-  condition_wide <- condition_activity_df %>%
-    pivot_wider(names_from = tf, values_from = activity) %>%
-    arrange(condition)
-
-  condition_names <- condition_wide$condition
-  condition_matrix <- condition_wide %>% select(-condition) %>% as.matrix()
-  rownames(condition_matrix) <- condition_names
-
-  valid_columns <- apply(condition_matrix, 2, function(x) !all(is.na(x)) && sd(x, na.rm = TRUE) > 0)
-  condition_matrix <- condition_matrix[, valid_columns, drop = FALSE]
-  condition_matrix <- condition_matrix[complete.cases(condition_matrix), , drop = FALSE]
-
-  coords <- compute_umap_coords(condition_matrix, rownames(condition_matrix), python_bin)
-  if (!is.null(coords)) {
-    coords$status <- ifelse(coords$label %in% unique(reference_conditions), "Reference", "Contrast")
-    coords$label <- factor(coords$label, levels = coords$label[order(coords$UMAP1, coords$UMAP2)])
-
-    p_conditions <- ggplot(coords, aes(x = UMAP1, y = UMAP2, color = status, label = label)) +
-      geom_point(size = 3.5) +
-      geom_text_repel(size = 3, max.overlaps = Inf, box.padding = 0.4, point.padding = 0.2) +
-      scale_color_manual(values = c("Reference" = "#f37f80", "Contrast" = "#6495ed"), name = NULL) +
-      theme_bw() +
-      labs(
-        title = "UMAP of Primetime Condition Activities",
-        x = "UMAP 1",
-        y = "UMAP 2"
-      ) +
-      theme(
-        legend.position = "bottom",
-        plot.title = element_text(hjust = 0.5, face = "bold")
-      )
-    plots_to_print[[length(plots_to_print) + 1]] <- p_conditions
-  }
-}
-
-if (nrow(primetime_logfc_df) > 0) {
-  logfc_wide <- primetime_logfc_df %>%
-    group_by(comparison, tf, reference_condition) %>%
-    summarise(logFC = mean(logFC, na.rm = TRUE), .groups = "drop") %>%
-    pivot_wider(names_from = tf, values_from = logFC, values_fill = 0) %>%
-    arrange(comparison)
-
-  comparison_labels <- logfc_wide$comparison
-  logfc_matrix <- logfc_wide %>% select(-comparison, -reference_condition) %>% as.matrix()
-  rownames(logfc_matrix) <- comparison_labels
-
-  valid_logfc_cols <- apply(logfc_matrix, 2, function(x) !all(is.na(x)) && sd(x, na.rm = TRUE) > 0)
-  logfc_matrix <- logfc_matrix[, valid_logfc_cols, drop = FALSE]
-  logfc_matrix[is.na(logfc_matrix)] <- 0
-
-  coords_logfc <- compute_umap_coords(logfc_matrix, rownames(logfc_matrix), python_bin)
-  if (!is.null(coords_logfc)) {
-    ref_lookup <- setNames(logfc_wide$reference_condition, logfc_wide$comparison)
-    coords_logfc$reference_condition <- ref_lookup[coords_logfc$label]
-    coords_logfc$status <- ifelse(grepl("control|ctrl|dmso", tolower(coords_logfc$reference_condition)), "vs Control", "Other reference")
-    coords_logfc$label <- factor(coords_logfc$label, levels = coords_logfc$label[order(coords_logfc$UMAP1, coords_logfc$UMAP2)])
-
-    p_logfc <- ggplot(coords_logfc, aes(x = UMAP1, y = UMAP2, color = status, label = label)) +
-      geom_point(size = 3.5) +
-      geom_text_repel(size = 3, max.overlaps = Inf, box.padding = 0.4, point.padding = 0.2) +
-      scale_color_manual(values = c("vs Control" = "#f37f80", "Other reference" = "#6495ed"), name = NULL) +
-      theme_bw() +
-      labs(
-        title = "UMAP of Primetime logFC Profiles (Comparison x TF)",
-        x = "UMAP 1",
-        y = "UMAP 2"
-      ) +
-      theme(
-        legend.position = "bottom",
-        plot.title = element_text(hjust = 0.5, face = "bold")
-      )
-    plots_to_print[[length(plots_to_print) + 1]] <- p_logfc
-  }
-}
-
 output_root <- dirname(dirname(normalizePath(opt$output, mustWork = FALSE)))
 barcode_activity_path <- file.path(output_root, "tmp_primetime", "activity", "barcode_activity.txt")
 
@@ -267,10 +201,21 @@ if (file.exists(barcode_activity_path) && file.info(barcode_activity_path)$size 
       if (!is.null(coords_samples)) {
         coords_samples$status <- ifelse(grepl("control|ctrl|dmso", tolower(coords_samples$label)), "Control", "Sample")
         coords_samples$label <- factor(coords_samples$label, levels = coords_samples$label[order(coords_samples$UMAP1, coords_samples$UMAP2)])
+        coords_samples <- select_spread_labels(coords_samples, "UMAP1", "UMAP2", "label")
 
-        p_samples <- ggplot(coords_samples, aes(x = UMAP1, y = UMAP2, color = status, label = label)) +
+        p_samples <- ggplot(coords_samples, aes(x = UMAP1, y = UMAP2, color = status)) +
           geom_point(size = 3.5) +
-          geom_text_repel(size = 3, max.overlaps = Inf, box.padding = 0.4, point.padding = 0.2) +
+          geom_text_repel(
+            data = subset(coords_samples, display_label != ""),
+            aes(label = display_label),
+            size = 2.8,
+            max.overlaps = Inf,
+            force = 1,
+            box.padding = 0.3,
+            point.padding = 0.1,
+            segment.alpha = 0.5,
+            min.segment.length = 0
+          ) +
           scale_color_manual(values = c("Control" = "#f37f80", "Sample" = "#6495ed"), name = NULL) +
           theme_bw() +
           labs(
@@ -283,6 +228,46 @@ if (file.exists(barcode_activity_path) && file.info(barcode_activity_path)$size 
             plot.title = element_text(hjust = 0.5, face = "bold")
           )
         plots_to_print[[length(plots_to_print) + 1]] <- p_samples
+
+        pca_result <- tryCatch(
+          prcomp(scale(sample_matrix), center = FALSE, scale. = FALSE),
+          error = function(e) NULL
+        )
+
+        if (!is.null(pca_result) && ncol(pca_result$x) >= 2) {
+          pca_scores <- as.data.frame(pca_result$x[, 1:2, drop = FALSE])
+          colnames(pca_scores) <- c("PC1", "PC2")
+          pca_scores$label <- rownames(pca_scores)
+          pca_scores$status <- ifelse(grepl("control|ctrl|dmso", tolower(pca_scores$label)), "Control", "Sample")
+          pca_scores <- select_spread_labels(pca_scores, "PC1", "PC2", "label")
+
+          var_explained <- summary(pca_result)$importance[2, 1:2] * 100
+          p_pca <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = status)) +
+            geom_point(size = 3.5) +
+            geom_text_repel(
+              data = subset(pca_scores, display_label != ""),
+              aes(label = display_label),
+              size = 2.8,
+              max.overlaps = Inf,
+              force = 1,
+              box.padding = 0.3,
+              point.padding = 0.1,
+              segment.alpha = 0.5,
+              min.segment.length = 0
+            ) +
+            scale_color_manual(values = c("Control" = "#f37f80", "Sample" = "#6495ed"), name = NULL) +
+            theme_bw() +
+            labs(
+              title = "PCA of Individual Sample Activities (QC Barcode Activity)",
+              x = paste0("PC1 (", sprintf("%.1f", var_explained[1]), "%)"),
+              y = paste0("PC2 (", sprintf("%.1f", var_explained[2]), "%)")
+            ) +
+            theme(
+              legend.position = "bottom",
+              plot.title = element_text(hjust = 0.5, face = "bold")
+            )
+          plots_to_print[[length(plots_to_print) + 1]] <- p_pca
+        }
       }
     }
   }

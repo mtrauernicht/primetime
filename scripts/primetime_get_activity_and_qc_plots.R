@@ -43,7 +43,7 @@ option_list <- list(
     make_option(c("--expected_pdna"), type = "character", help = "Path to expected pDNA counts"),
     make_option(c("--cdna_output"), type = "character", help = "Path to save the cDNA counts for MPRAnalyze"),
     make_option(c("--barcode_activity_output"), type = "character", help = "Path to save barcode-level activity used for barcode correlations"),
-    make_option(c("--viability_file"), type = "character", default = "", help = "Optional semicolon-separated viability matrix")
+    make_option(c("--viability_file"), type = "character", default = "", help = "Optional comma-separated viability matrix files")
 )
 
 # Functions for the plots
@@ -53,8 +53,11 @@ upper_diag_plot <- function(data, mapping, color = I("black"), sizeRange = c(1, 
 
     x <- eval_data_col(data, mapping$x)
     y <- eval_data_col(data, mapping$y)
-    r <- cor(x, y, "pairwise.complete.obs")
-    rt <- format(r, digits = 3)
+    r <- suppressWarnings(cor(x, y, use = "pairwise.complete.obs"))
+    if (!is.finite(r)) {
+        r <- NA_real_
+    }
+    rt <- if (is.na(r)) "NA" else format(r, digits = 3)
     tt <- as.character(rt)
     cex <- max(sizeRange)
 
@@ -66,7 +69,7 @@ upper_diag_plot <- function(data, mapping, color = I("black"), sizeRange = c(1, 
     # plot correlation coefficient
     p <- ggally_text(
         label = tt, mapping = aes(), xP = 0.5, yP = 0.5,
-        size = I(percent_of_range(cex * abs(r), sizeRange)) + 5, color = color, ...
+        size = I(percent_of_range(cex * ifelse(is.na(r), 0, abs(r)), sizeRange)) + 5, color = color, ...
     ) +
         theme(
             panel.grid.minor = element_blank(),
@@ -75,7 +78,9 @@ upper_diag_plot <- function(data, mapping, color = I("black"), sizeRange = c(1, 
 
     corColors <- RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")[2:6]
 
-    if (r <= boundaries[1]) {
+    if (is.na(r)) {
+        corCol <- "grey90"
+    } else if (r <= boundaries[1]) {
         corCol <- corColors[1]
     } else if (r <= boundaries[2]) {
         corCol <- corColors[2]
@@ -549,86 +554,255 @@ counts_df %>%
 
 invisible(dev.off())
 
-viability_df <- read_viability_matrix(opt$viability_file)
-if (!is.null(viability_df)) {
-    viability_heatmap_df <- viability_df %>%
-        mutate(
-            row = factor(substr(well, 1, 1), levels = LETTERS[1:16]),
-            column = suppressWarnings(as.integer(sub("^[A-Za-z]+", "", well)))
-        ) %>%
-        filter(!is.na(column), !is.na(row)) %>%
-        complete(row, column = 1:24)
-
-    message("==== Plotting viability heatmap")
-    pdf(file.path(opt$plots_basedir, "viability_well_heatmap.pdf"), width = 12, height = 7)
-    print(
-        ggplot(viability_heatmap_df, aes(x = column, y = row, fill = viability)) +
-            geom_tile(color = "white", linewidth = 0.25) +
-            scale_x_continuous(breaks = 1:24, expand = c(0, 0)) +
-            scale_y_discrete(limits = rev(levels(viability_heatmap_df$row)), expand = c(0, 0)) +
-            scale_fill_gradientn(colors = viridisLite::viridis(256), na.value = "grey90") +
-            coord_fixed() +
-            theme_pubr(border = T) +
-            labs(
-                title = "Viability per well",
-                x = "Column",
-                y = "Row",
-                fill = "Viability"
-            ) +
-            theme(
-                panel.grid = element_blank(),
-                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
-            )
+read_count_summary_df <- counts_df %>%
+    filter(!pDNA) %>%
+    select(replicate, sample, total_read_count) %>%
+    distinct() %>%
+    mutate(
+        condition = sub("_[0-9]+$", "", replicate),
+        read_count_lt_25000 = total_read_count < 25000
     )
+
+write.table(
+    read_count_summary_df,
+    file = file.path(opt$activity_basedir, "read_count_per_sample.tsv"),
+    row.names = FALSE,
+    quote = FALSE,
+    sep = "\t"
+)
+
+viability_paths <- if (is.null(opt$viability_file) || !nzchar(trimws(opt$viability_file))) {
+    character(0)
+} else {
+    trimws(unlist(strsplit(opt$viability_file, "[,;\n]+")))
+}
+viability_paths <- viability_paths[viability_paths != ""]
+viability_matrices <- lapply(seq_along(viability_paths), function(plate_index) {
+    viability_df <- read_viability_matrix(viability_paths[plate_index])
+    if (is.null(viability_df)) {
+        message("==== Skipping missing or empty viability file: ", viability_paths[plate_index])
+        return(NULL)
+    }
+    viability_df %>%
+        mutate(
+            plate_index = .env$plate_index,
+            plate_name = paste0("Plate ", .env$plate_index)
+        )
+})
+viability_matrices <- Filter(Negate(is.null), viability_matrices)
+viability_matrices <- lapply(seq_along(viability_matrices), function(plate_index) {
+    viability_matrices[[plate_index]] %>%
+        mutate(
+            plate_index = .env$plate_index,
+            plate_name = paste0("Plate ", .env$plate_index)
+        )
+})
+
+if (length(viability_matrices) > 0) {
+    message("==== Plotting viability heatmaps")
+    pdf(file.path(opt$plots_basedir, "viability_well_heatmap.pdf"), width = 12, height = 7)
+    for (viability_df in viability_matrices) {
+        viability_heatmap_df <- viability_df %>%
+            mutate(
+                row = factor(substr(well, 1, 1), levels = LETTERS[1:16]),
+                column = suppressWarnings(as.integer(sub("^[A-Za-z]+", "", well)))
+            ) %>%
+            filter(!is.na(column), !is.na(row)) %>%
+            complete(row, column = 1:24)
+
+        print(
+            ggplot(viability_heatmap_df, aes(x = column, y = row, fill = viability)) +
+                geom_tile(color = "white", linewidth = 0.25) +
+                scale_x_continuous(breaks = 1:24, expand = c(0, 0)) +
+                scale_y_discrete(limits = rev(levels(viability_heatmap_df$row)), expand = c(0, 0)) +
+                scale_fill_gradientn(colors = viridisLite::viridis(256), na.value = "grey90") +
+                coord_fixed() +
+                theme_pubr(border = T) +
+                labs(
+                    title = paste("Viability per well -", unique(viability_df$plate_name)),
+                    x = "Column",
+                    y = "Row",
+                    fill = "Viability"
+                ) +
+                theme(
+                    panel.grid = element_blank(),
+                    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+                    legend.position = "bottom",
+                    legend.direction = "horizontal",
+                    legend.text = element_text(size = 10),
+                    legend.key.width = grid::unit(1.2, "cm")
+                )
+        )
+    }
     invisible(dev.off())
 
     design_map <- read_design_map(opt$design)
-
-    read_count_wells_df <- counts_df %>%
+    read_count_by_replicate_df <- counts_df %>%
         filter(!pDNA) %>%
-        group_by(sample) %>%
+        group_by(sample, replicate) %>%
         summarise(total_read_count = first(total_read_count), .groups = "drop") %>%
+        mutate(plate_index = suppressWarnings(as.integer(sub(".*_([0-9]+)$", "\\1", replicate)))) %>%
         filter(total_read_count > 0)
+
+    if (length(viability_matrices) == 1) {
+        read_count_wells_df <- read_count_by_replicate_df %>%
+            group_by(sample) %>%
+            summarise(total_read_count = first(total_read_count), .groups = "drop") %>%
+            mutate(plate_index = 1L)
+    } else {
+        read_count_wells_df <- read_count_by_replicate_df %>%
+            filter(plate_index %in% seq_along(viability_matrices))
+    }
 
     if (!is.null(design_map)) {
         read_count_wells_df <- read_count_wells_df %>%
             inner_join(design_map, by = "sample") %>%
-            distinct(well, .keep_all = TRUE)
+            distinct(plate_index, well, .keep_all = TRUE)
         message("==== Viability design map rows: ", nrow(design_map))
     } else {
         read_count_wells_df <- read_count_wells_df %>%
             mutate(well = normalize_well_id(sample)) %>%
             filter(well != "") %>%
-            distinct(well, .keep_all = TRUE)
+            distinct(plate_index, well, .keep_all = TRUE)
         message("==== Viability design map unavailable; falling back to sample-derived wells")
     }
 
-    viability_read_count_df <- read_count_wells_df %>%
-        inner_join(
-            viability_df %>% select(well, viability),
-            by = "well"
-        )
-    message("==== Viability overlaps: ", nrow(viability_read_count_df))
+    viability_read_count_df <- map_dfr(viability_matrices, function(viability_df) {
+        this_plate_index <- unique(viability_df$plate_index)
+        read_count_wells_df %>%
+            filter(plate_index == this_plate_index) %>%
+            inner_join(viability_df %>% select(well, viability), by = "well") %>%
+            mutate(plate_name = unique(viability_df$plate_name))
+    }) %>%
+        group_by(plate_index) %>%
+        mutate(
+            dmso_mean_viability = mean(viability[grepl("dmso", sample, ignore.case = TRUE)], na.rm = TRUE),
+            dmso_mean_viability = ifelse(!is.finite(dmso_mean_viability) | dmso_mean_viability <= 0, 1, dmso_mean_viability),
+            viability_rel_dmso = viability / dmso_mean_viability
+        ) %>%
+        ungroup()
+
     message("==== Plotting read count versus viability")
     pdf(file.path(opt$plots_basedir, "read_counts_vs_viability.pdf"), width = 8, height = 6)
-    if (nrow(viability_read_count_df) >= 2) {
-        print(
-            ggplot(viability_read_count_df, aes(x = viability, y = total_read_count)) +
-                geom_point(alpha = 0.35, size = 1.4) +
-                geom_smooth(method = "lm", se = FALSE, color = "#4c78a8") +
-                stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
-                theme_pubr(border = T) +
-                labs(
-                    title = "Read counts versus viability",
-                    x = "Viability",
-                    y = "Total read count"
-                )
-        )
-    } else {
-        plot.new()
-        text(0.5, 0.5, "No overlapping wells found for viability plot")
+    for (this_plate_name in unique(viability_read_count_df$plate_name)) {
+        this_plate_df <- viability_read_count_df %>% filter(.data$plate_name == this_plate_name)
+        max_viability_rel <- max(this_plate_df$viability_rel_dmso, na.rm = TRUE)
+        if (!is.finite(max_viability_rel) || max_viability_rel <= 0) {
+            max_viability_rel <- 1
+        }
+        if (nrow(this_plate_df) >= 2) {
+            outlier_fit <- tryCatch(
+                lm(log1p(total_read_count) ~ viability_rel_dmso, data = this_plate_df),
+                error = function(e) NULL
+            )
+            if (!is.null(outlier_fit)) {
+                y_outlier_score <- abs(rstandard(outlier_fit))
+                x_outlier_score <- abs(as.numeric(scale(this_plate_df$viability_rel_dmso)))
+                x_outlier_score[!is.finite(x_outlier_score)] <- 0
+                this_plate_df$outlier_score <- pmax(y_outlier_score, x_outlier_score)
+                label_df <- this_plate_df %>%
+                    filter(is.finite(outlier_score)) %>%
+                    slice_max(order_by = outlier_score, n = 10, with_ties = FALSE)
+            } else {
+                label_df <- this_plate_df[0, , drop = FALSE]
+            }
+            print(
+                ggplot(this_plate_df, aes(x = viability_rel_dmso, y = total_read_count)) +
+                    geom_point(alpha = 0.35, size = 1.4) +
+                    geom_text_repel(
+                        data = label_df,
+                        aes(label = sample),
+                        max.overlaps = 10,
+                        box.padding = 0.35,
+                        point.padding = 0.2
+                    ) +
+                    geom_smooth(method = "lm", se = FALSE, color = "#4c78a8") +
+                    stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
+                    scale_x_continuous(limits = c(0, max_viability_rel), expand = c(0, 0)) +
+                    theme_pubr(border = T) +
+                    labs(
+                        title = paste("Read counts versus viability -", this_plate_name),
+                        x = "Viability / mean DMSO viability",
+                        y = "Total read count"
+                    )
+            )
+        } else {
+            plot.new()
+            text(0.5, 0.5, paste("No overlapping wells found for", this_plate_name))
+        }
     }
     invisible(dev.off())
+
+    message("==== Plotting viability correlation between plates")
+    pdf(file.path(opt$plots_basedir, "viability_plate_correlations.pdf"), width = 8, height = 6)
+    if (length(viability_matrices) >= 2) {
+        plate_pairs <- combn(seq_along(viability_matrices), 2, simplify = FALSE)
+        for (plate_pair in plate_pairs) {
+            first_plate <- viability_matrices[[plate_pair[1]]]
+            second_plate <- viability_matrices[[plate_pair[2]]]
+            correlation_df <- first_plate %>%
+                select(well, viability_first = viability) %>%
+                inner_join(second_plate %>% select(well, viability_second = viability), by = "well")
+            if (nrow(correlation_df) >= 2) {
+                if (!is.null(design_map)) {
+                    correlation_df <- correlation_df %>%
+                        left_join(design_map %>% select(well, sample), by = "well")
+                } else {
+                    correlation_df <- correlation_df %>%
+                        mutate(sample = well)
+                }
+                correlation_fit <- tryCatch(
+                    lm(viability_second ~ viability_first, data = correlation_df),
+                    error = function(e) NULL
+                )
+                if (!is.null(correlation_fit)) {
+                    y_outlier_score <- abs(rstandard(correlation_fit))
+                    x_outlier_score <- abs(as.numeric(scale(correlation_df$viability_first)))
+                    x_outlier_score[!is.finite(x_outlier_score)] <- 0
+                    correlation_df$outlier_score <- pmax(y_outlier_score, x_outlier_score)
+                    correlation_labels <- correlation_df %>%
+                        filter(is.finite(outlier_score)) %>%
+                        slice_max(order_by = outlier_score, n = 10, with_ties = FALSE)
+                } else {
+                    correlation_labels <- correlation_df[0, , drop = FALSE]
+                }
+                print(
+                    ggplot(correlation_df, aes(x = viability_first, y = viability_second)) +
+                        geom_point(alpha = 0.5, size = 1.4) +
+                        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+                        geom_text_repel(
+                            data = correlation_labels,
+                            aes(label = sample),
+                            max.overlaps = 10,
+                            box.padding = 0.35,
+                            point.padding = 0.2
+                        ) +
+                        stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
+                        theme_pubr(border = T) +
+                        labs(
+                            title = paste("Viability correlation:", first_plate$plate_name[1], "vs", second_plate$plate_name[1]),
+                            x = paste(first_plate$plate_name[1], "viability"),
+                            y = paste(second_plate$plate_name[1], "viability")
+                        )
+                )
+            } else {
+                plot.new()
+                text(0.5, 0.5, "No overlapping wells found between plates")
+            }
+        }
+    } else {
+        plot.new()
+        text(0.5, 0.5, "At least two viability files are required")
+    }
+    invisible(dev.off())
+} else {
+    message("==== No viability file provided or file missing; writing placeholder viability QC PDFs")
+    for (output_file in c("viability_well_heatmap.pdf", "read_counts_vs_viability.pdf", "viability_plate_correlations.pdf")) {
+        pdf(file.path(opt$plots_basedir, output_file), width = 8, height = 6)
+        plot.new()
+        text(0.5, 0.5, "No viability file provided")
+        invisible(dev.off())
+    }
 }
 
 # Plot correlation between cDNA and pDNA =======================================
@@ -754,30 +928,16 @@ for (this_cdna_sample in cdna_sample) {
     }
 }
 
-barcode_activity_df <- activity_df %>%
-    filter(!negative_control) %>%
-    group_by(cDNA_sample, barcode, tf, promoter) %>%
-    summarise(
-        mean_RPM = mean(activity_RPM),
-        log2_mean_RPM = log2(mean_RPM),
-        .groups = "drop"
-    )
-
-if (!is.null(opt$barcode_activity_output)) {
-    write.table(
-        barcode_activity_df,
-        file = opt$barcode_activity_output,
-        row.names = FALSE, quote = F, sep = "\t"
-    )
+summarise_barcode_activity <- function(df) {
+    df %>%
+        filter(!negative_control) %>%
+        group_by(cDNA_sample, barcode, tf, promoter) %>%
+        summarise(
+            mean_RPM = mean(activity_RPM),
+            log2_mean_RPM = log2(mean_RPM),
+            .groups = "drop"
+        )
 }
-
-activity_summary_df <- activity_df %>%
-    group_by(cDNA_sample, barcode, tf, negative_control, promoter) %>%
-    summarise(
-        mean_RPM = mean(activity_RPM),
-        log2_mean_RPM = log2(mean_RPM),
-        .groups = "drop"
-    )
 
 control_condition <-
     all_cdna_conditions[str_detect(str_to_lower(all_cdna_conditions), "control|ctrl|dmso")][1]
@@ -794,24 +954,46 @@ if (length(control_replicates) == 0) {
     control_replicates <- cdna_sample[1]
 }
 
-barcode_control_comparison_df <-
+build_barcode_control_comparison <- function(barcode_activity_df, control_replicates) {
     barcode_activity_df %>%
-    filter(!cDNA_sample %in% control_replicates) %>%
-    inner_join(
-        barcode_activity_df %>%
-            filter(cDNA_sample %in% control_replicates) %>%
-            group_by(barcode, tf, promoter) %>%
-            summarise(
-                control_mean_RPM = mean(mean_RPM),
-                control_log2_mean_RPM = log2(control_mean_RPM),
-                .groups = "drop"
-            ),
-        by = c("barcode", "tf", "promoter")
-    ) %>%
-    mutate(
-        comparison = cDNA_sample,
-        sample_log2_mean_RPM = log2_mean_RPM,
-        deviation = sample_log2_mean_RPM - control_log2_mean_RPM
+        filter(!cDNA_sample %in% control_replicates) %>%
+        inner_join(
+            barcode_activity_df %>%
+                filter(cDNA_sample %in% control_replicates) %>%
+                group_by(barcode, tf, promoter) %>%
+                summarise(
+                    control_mean_RPM = mean(mean_RPM),
+                    control_log2_mean_RPM = log2(control_mean_RPM),
+                    .groups = "drop"
+                ),
+            by = c("barcode", "tf", "promoter")
+        ) %>%
+        mutate(
+            comparison = cDNA_sample,
+            sample_log2_mean_RPM = log2_mean_RPM,
+            deviation = sample_log2_mean_RPM - control_log2_mean_RPM,
+            residual = sample_log2_mean_RPM - control_log2_mean_RPM
+        )
+}
+
+barcode_activity_df <- summarise_barcode_activity(activity_df)
+
+barcode_control_comparison_df <- build_barcode_control_comparison(barcode_activity_df, control_replicates)
+
+if (!is.null(opt$barcode_activity_output)) {
+    write.table(
+        barcode_activity_df,
+        file = opt$barcode_activity_output,
+        row.names = FALSE, quote = F, sep = "\t"
+    )
+}
+
+activity_summary_df <- activity_df %>%
+    group_by(cDNA_sample, barcode, tf, negative_control, promoter) %>%
+    summarise(
+        mean_RPM = mean(activity_RPM),
+        log2_mean_RPM = log2(mean_RPM),
+        .groups = "drop"
     )
 
 barcode_control_labels <-
@@ -871,6 +1053,174 @@ for (page_idx in seq_along(barcode_control_pages)) {
     print(p)
 }
 invisible(dev.off())
+
+control_residual_correlation_stats <-
+    barcode_control_comparison_df %>%
+    filter(is.finite(control_log2_mean_RPM), is.finite(residual)) %>%
+    group_by(comparison) %>%
+    group_modify(~ {
+        this_df <- .x
+        n_points <- nrow(this_df)
+        n_unique_x <- n_distinct(this_df$control_log2_mean_RPM)
+
+        if (n_points < 10 || n_unique_x < 5) {
+            return(data.frame(
+                n_points = n_points,
+                n_unique_x = n_unique_x,
+                slope = NA_real_,
+                corr = NA_real_,
+                corr_p_two_sided = NA_real_,
+                test_status = "insufficient_points"
+            ))
+        }
+
+        fit <- tryCatch(
+            lm(residual ~ control_log2_mean_RPM, data = this_df),
+            error = function(e) NULL
+        )
+        corr_test <- tryCatch(
+            cor.test(this_df$control_log2_mean_RPM, this_df$residual, method = "pearson", alternative = "two.sided"),
+            error = function(e) NULL
+        )
+
+        if (is.null(fit) || is.null(corr_test)) {
+            return(data.frame(
+                n_points = n_points,
+                n_unique_x = n_unique_x,
+                slope = NA_real_,
+                corr = NA_real_,
+                corr_p_two_sided = NA_real_,
+                test_status = "fit_failed"
+            ))
+        }
+
+        fit_coef <- summary(fit)$coefficients
+        slope_term <- "control_log2_mean_RPM"
+        if (!slope_term %in% rownames(fit_coef)) {
+            return(data.frame(
+                n_points = n_points,
+                n_unique_x = n_unique_x,
+                slope = NA_real_,
+                corr = NA_real_,
+                corr_p_two_sided = NA_real_,
+                test_status = "slope_term_missing"
+            ))
+        }
+
+        data.frame(
+            n_points = n_points,
+            n_unique_x = n_unique_x,
+            slope = unname(fit_coef[slope_term, "Estimate"]),
+            corr = unname(corr_test$estimate),
+            corr_p_two_sided = unname(corr_test$p.value),
+            test_status = "ok"
+        )
+    }) %>%
+    ungroup() %>%
+    mutate(
+        corr_p_two_sided_adj = ifelse(is.na(corr_p_two_sided), NA_real_, p.adjust(corr_p_two_sided, method = "BH")),
+        has_correlation = test_status == "ok" & !is.na(corr_p_two_sided_adj) & corr_p_two_sided_adj < 0.0001,
+        has_negative_correlation = has_correlation & corr < 0,
+        has_positive_correlation = has_correlation & !is.na(slope) & !is.na(corr) & slope > 0.125 & corr > 0,
+        correlation_label = case_when(
+            has_positive_correlation ~ "Correlation: POSITIVE",
+            has_negative_correlation ~ "Correlation: NEGATIVE",
+            has_correlation ~ "Correlation: YES",
+            test_status != "ok" ~ "Correlation: test unavailable",
+            TRUE ~ "Correlation: NO"
+        ),
+        positive_slope_label = case_when(
+            test_status != "ok" ~ "Positive slope > 0.125: test unavailable",
+            is.na(slope) ~ "Positive slope > 0.125: NA",
+            slope > 0.125 ~ "Positive slope > 0.125: YES",
+            TRUE ~ "Positive slope > 0.125: NO"
+        ),
+        p_label = ifelse(
+            is.na(corr_p_two_sided_adj),
+            "adj p(two-sided)=NA",
+            paste0("adj p(two-sided)=", formatC(corr_p_two_sided_adj, format = "e", digits = 2))
+        ),
+        corr_label = ifelse(
+            is.na(corr),
+            "r=NA",
+            paste0("r=", formatC(corr, format = "f", digits = 3))
+        ),
+        slope_label = ifelse(
+            is.na(slope),
+            "slope=NA",
+            paste0("slope=", formatC(slope, format = "f", digits = 4))
+        ),
+        facet_label = paste(correlation_label, positive_slope_label, p_label, corr_label, slope_label, sep = "\n")
+    )
+
+write.table(
+    control_residual_correlation_stats %>% select(-facet_label),
+    file = file.path(opt$plots_basedir, "control_barcode_residual_correlation_stats.tsv"),
+    row.names = FALSE,
+    quote = FALSE,
+    sep = "\t"
+)
+
+# Keep legacy output path for downstream compatibility.
+write.table(
+    control_residual_correlation_stats %>% select(-facet_label),
+    file = file.path(opt$plots_basedir, "control_barcode_residual_negative_correlation_stats.tsv"),
+    row.names = FALSE,
+    quote = FALSE,
+    sep = "\t"
+)
+
+message("==== Plotting residuals vs control with correlation test")
+pdf(file.path(opt$plots_basedir, "control_barcode_residuals_with_correlation_test.pdf"), width = 16, height = 16)
+for (page_idx in seq_along(barcode_control_pages)) {
+    page_comparisons <- barcode_control_pages[[page_idx]]
+    page_df <- barcode_control_comparison_df %>%
+        filter(comparison %in% page_comparisons) %>%
+        mutate(comparison = factor(comparison, levels = page_comparisons))
+    page_labels <- barcode_control_labels %>%
+        filter(comparison %in% page_comparisons) %>%
+        mutate(comparison = factor(comparison, levels = page_comparisons))
+    page_stats <- control_residual_correlation_stats %>%
+        filter(comparison %in% page_comparisons) %>%
+        mutate(comparison = factor(comparison, levels = page_comparisons))
+
+    if (nrow(page_df) == 0) {
+        next
+    }
+
+    p <- ggplot(page_df, aes(x = control_log2_mean_RPM, y = residual)) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+        geom_point(alpha = 0.25, size = 0.7) +
+        geom_smooth(method = "lm", formula = y ~ x, se = FALSE, color = "#2c7fb8", linewidth = 0.7) +
+        geom_text(
+            data = page_stats,
+            aes(x = -Inf, y = Inf, label = facet_label),
+            inherit.aes = FALSE,
+            hjust = -0.02,
+            vjust = 1.05,
+            size = 2.9,
+            lineheight = 0.95
+        ) +
+        facet_wrap(~comparison, ncol = 5) +
+        theme_pubr(border = T) +
+        ggtitle(paste0("Residual barcode activity vs ", control_condition, " control (page ", page_idx, "/", length(barcode_control_pages), ")")) +
+        xlab(paste0(control_condition, " control barcode activity (log2 mean RPM)")) +
+        ylab("Residual activity (sample - control, log2 mean RPM)") +
+        theme(
+            text = element_text(size = 14),
+            strip.text = element_text(size = 8, face = "bold"),
+            axis.text = element_text(size = 7)
+        )
+    print(p)
+}
+invisible(dev.off())
+
+# Keep legacy plot filename for downstream compatibility.
+file.copy(
+    from = file.path(opt$plots_basedir, "control_barcode_residuals_with_correlation_test.pdf"),
+    to = file.path(opt$plots_basedir, "control_barcode_residuals_with_negative_correlation_test.pdf"),
+    overwrite = TRUE
+)
 
 ################################ PLOT REPLICATE CORRELATIONS #############################
 
