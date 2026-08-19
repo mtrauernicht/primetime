@@ -8,50 +8,221 @@ library(tidyr)
 library(tibble)
 library(dplyr)
 library(reshape2)
+library(readr)
 
-tf_list <- read.delim("/DATA/pipelines/primetime/misc/tf_functions.tsv", header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE) %>%
-  distinct(tf) %>%
-  mutate(tf = gsub("::.*", "", tf)) %>%
-  pull(tf)
+tf_df <- read.delim("/DATA/pipelines/primetime/misc/tf_functions.tsv",
+                     header = TRUE, sep = "\t",
+                     stringsAsFactors = FALSE, check.names = FALSE) %>%
+    distinct(tf)
+
+# tf_df$tf holds the full/composite names, e.g. POU5F1::SOX2, RARA::RXRA
+# extract just the first gene symbol for GO/semantic similarity lookup
+tf_df <- tf_df %>%
+    mutate(tf_symbol = sub("::.*", "", tf))   # takes gene before first "::"
+
+tf_list_symbols <- tf_df$tf_symbol   # used for mgeneSim/godata lookup
+tf_list_names   <- tf_df$tf          # used for final display names
 
 semData <- godata(org.Hs.eg.db, ont = "BP", keytype = "SYMBOL")
 
-tf_sim <- matrix(NA_real_, nrow = length(tf_list), ncol = length(tf_list),
-                 dimnames = list(tf_list, tf_list))
+tf_sim <- mgeneSim(tf_list_symbols, semData = semData, measure = "Wang", drop = "IEA")
+tf_sim <- tf_sim[tf_list_symbols, tf_list_symbols]
 
-for (i in seq_along(tf_list)) {
-    for (j in i:length(tf_list)) {
-        val <- tryCatch({
-            geneSim(tf_list[i], tf_list[j], semData = semData, measure = "Wang")$geneSim
-        }, error = function(e) NA_real_)
-        if (length(val) != 1 || is.nan(val)) val <- NA_real_
-        tf_sim[i, j] <- val
-        tf_sim[j, i] <- val
-    }
-}
-
-
-# Map back heterodimers
-rename_map <- c("POU5F1.1" = "POU5F1::SOX2",
-                "RARA.1"   = "RARA::RXRA",
-                "AHR"      = "AHR::ARNT",
-                "STAT1.1"  = "STAT1::STAT2",
-                "MAF"      = "MAF::NFE2",
-                "FOS"      = "FOS::JUN",
-                "SMAD2"    = "SMAD2::3::4")
-
-
-tf_sim_long <- melt(tf_sim, varnames = c("tf1", "tf2"), value.name = "similarity")
-
-tf_sim_long <- tf_sim_long %>%
-    mutate(
-        tf1 = recode(tf1, !!!rename_map),
-        tf2 = recode(tf2, !!!rename_map)
-    )
-
+# reindex using the display names, matched by position
+rownames(tf_sim) <- tf_list_names
+colnames(tf_sim) <- tf_list_names
 
 write.csv(tf_sim, file = "/DATA/pipelines/primetime/misc/tf_similarity_gosemsim.csv", quote = FALSE)
-
 ```
 
+
+
+```{r}
+tf_function_map <- NULL
+tf_function_order <- character(0)
+tf_order_in_map <- character(0)
+tf_function_map <- read.table("/DATA/pipelines/primetime/misc/tf_functions.tsv", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+tf_function_map$tf <- trimws(as.character(tf_function_map$tf))
+tf_function_map$biological_function <- trimws(as.character(tf_function_map$biological_function))
+tf_function_order <- unique(tf_function_map$biological_function)
+tf_order_in_map <- unique(tf_function_map$tf)
+
+all_results <- read_delim("/DATA/shared/projects/TF_REPORTERS/prime_TF_reporters/E2951_HCT_test_gcf8755/003_OUTPUT_bc_comb_cat/primetime_results/output_data/120693_vs_DMSO.txt")
+
+logfc_threshold <- 0
+p_threshold <- 0.01
+
+all_results <- all_results %>%
+        mutate(
+                # adjust p-values
+                p_adjusted = p.adjust(P.Value, method = "BH"),
+                # define significance: original BCalm logFC should be in the correct direction, new logFC should have a certain magnitude
+                sig = ifelse(logFC > logfc_threshold & old_logFC > 0 & p_adjusted <= p_threshold, "Upregulated",
+                        ifelse(logFC < -logfc_threshold & old_logFC < 0 & p_adjusted <= p_threshold, "Downregulated",
+                                "NS"
+                        )
+                )
+        )
+
+
+
+circular_plot_df <-
+        all_results %>%
+        filter(!grepl("RANDOM", tf)) %>%
+        mutate(tf_lookup = trimws(as.character(tf))) %>%
+        left_join(
+                if (!is.null(tf_function_map)) {
+                        tf_function_map %>%
+                                mutate(tf_lookup = trimws(as.character(tf))) %>%
+                                dplyr::select(tf_lookup, biological_function)
+                } else {
+                        data.frame(tf_lookup = character(0), biological_function = character(0))
+                },
+                by = "tf_lookup"
+        ) %>%
+        mutate(
+                biological_function = ifelse(is.na(biological_function), "Unknown", biological_function),
+                biological_function_order = match(biological_function, c(tf_function_order, "Unknown")),
+                biological_function_order = ifelse(is.na(biological_function_order), length(c(tf_function_order, "Unknown")) + 1, biological_function_order),
+                biological_function = factor(
+                        biological_function,
+                        levels = c(tf_function_order, setdiff("Unknown", tf_function_order))
+                ),
+                tf_map_order = match(tf_lookup, tf_order_in_map),
+                tf_map_order = ifelse(is.na(tf_map_order), Inf, tf_map_order)
+        ) %>%
+        arrange(biological_function_order, tf_map_order, tf_lookup) %>%
+        distinct(tf, .keep_all = TRUE) %>%
+        mutate(color_axis = ifelse(sig == "Upregulated", "#f37f80",
+                                    ifelse(sig == "NS", "gray30", "#6495ed"))
+        ) %>%
+        mutate(x_index = row_number())
+
+if (nrow(circular_plot_df) > 0) {
+                activity_limits <- range(
+                        circular_plot_df$logFC,
+                        na.rm = TRUE
+                )
+                base_radius <- abs(min(activity_limits, na.rm = TRUE)) + 1
+                lower_fold_limit <- if (activity_limits[1] < -3) activity_limits[1] - 1 else -3
+                upper_fold_limit <- if (activity_limits[2] > 3) activity_limits[2] + 1 else 3
+                y_breaks <- seq(lower_fold_limit, upper_fold_limit, by = 1)
+                circular_plot_df <- circular_plot_df %>%
+                  mutate(
+                    fold_change_radius = base_radius + logFC,
+                    x_index = row_number(),
+                    y_axis_label = "Fold change (log2)",
+                    sig_group = cumsum(c(TRUE, sig[-1] != sig[-n()])),
+                    function_group = 
+                      cumsum(c(TRUE, as.character(biological_function)[-1] != as.character(biological_function)[-n()]))
+                        )
+
+                ribbon_polygons <- do.call(
+                        rbind,
+                        lapply(seq_len(nrow(circular_plot_df)), function(index) {
+                                current_row <- circular_plot_df[index, ]
+                                next_index <- if (index == nrow(circular_plot_df)) 1 else index + 1
+                                next_row <- circular_plot_df[next_index, ]
+                                segment_fill <- if (current_row$sig != "NS") current_row$sig else next_row$sig
+                                data.frame(
+                                        polygon_id = index,
+                                        fill_group = segment_fill,
+                                        x = c(
+                                                current_row$x_index,
+                                                next_row$x_index,
+                                                next_row$x_index,
+                                                current_row$x_index
+                                        ),
+                                        y = c(
+                                                current_row$fold_change_radius,
+                                                next_row$fold_change_radius,
+                                                base_radius,
+                                                base_radius
+                                        )
+                                )
+                        })
+                )
+
+                line_plot_df <- circular_plot_df %>%
+                        dplyr::select(x_index, fold_change_radius, sig) %>%
+                        bind_rows(tibble(
+                                x_index = max(circular_plot_df$x_index) + 1,
+                                fold_change_radius = circular_plot_df$fold_change_radius[1],
+                                sig = circular_plot_df$sig[1]
+                        ))
+
+                leader_line_df <- circular_plot_df %>%
+                        mutate(label_radius = base_radius + upper_fold_limit + 1.15)
+                
+                label_df <- circular_plot_df %>%
+                  mutate(
+                    label_radius = base_radius + upper_fold_limit + 1.15,
+                    text_radius = label_radius + 0.35,
+                    label_angle_raw = 90 - 360 * (x_index - 0.5) / nrow(circular_plot_df),
+                    label_angle = ifelse(label_angle_raw < -90, label_angle_raw + 180, label_angle_raw),
+                    label_hjust = ifelse(label_angle_raw < -90, 1, 0)
+                  )
+                
+                # small stub segments for functions with only one TF, since geom_path
+                # needs at least 2 points per group to draw anything
+                group_sizes <- label_df %>% dplyr::count(function_group)
+                singleton_groups <- group_sizes$function_group[group_sizes$n == 1]
+                
+                singleton_df <- label_df %>%
+                  dplyr::filter(function_group %in% singleton_groups) %>%
+                  mutate(x_start = x_index - 0.3, x_end = x_index + 0.3)
+
+                function_levels <- unique(as.character(circular_plot_df$biological_function))
+                function_levels <- function_levels[!is.na(function_levels)]
+                function_colors <- setNames(grDevices::hcl.colors(length(function_levels), "Dark 3"), function_levels)
+                if ("Unknown" %in% names(function_colors)) {
+                        function_colors["Unknown"] <- "grey50"
+                }
+
+        p_circular <- circular_plot_df %>%
+                ggplot() +
+                                geom_polygon(data = ribbon_polygons, aes(x = x, y = y, fill = fill_group, group = polygon_id), alpha = 0.35) +
+                                geom_segment(data = leader_line_df, aes(x = x_index, xend = x_index, y = fold_change_radius, yend = label_radius), color = "grey85", linewidth = 0.3) +
+          geom_line(data = line_plot_df, color = "grey60", aes(x = x_index, y = fold_change_radius, group = 1), size = 1) +
+          geom_point(aes(x = x_index, y = fold_change_radius, fill = sig),
+                     shape = 21, color = "grey30", size = 3) +
+          geom_path(data = label_df, aes(x = x_index, y = label_radius, group = function_group, color = biological_function),
+                    linewidth = 1.2, lineend = "round") +
+          geom_segment(data = singleton_df, aes(x = x_start, xend = x_end, y = label_radius, yend = label_radius, color = biological_function),
+                       linewidth = 1.2, lineend = "round") +
+          geom_text(data = label_df, aes(x = x_index, y = text_radius, label = tf,
+                                         angle = label_angle, hjust = label_hjust),
+                    size = 6, vjust = 0.5, color = "grey15") +
+                scale_fill_manual(values = c("NS" = "grey80", "Downregulated" = "#6495ed", "Upregulated" = "#f37f80")) +
+                                scale_color_manual(values = function_colors, guide = "none") +
+                                guides(fill = "none") +
+                                scale_x_continuous(
+                                        breaks = circular_plot_df$x_index,
+                                        limits = c(0.5, max(circular_plot_df$x_index) + 0.5),
+                                        expand = expansion(mult = c(0, 0))
+                                ) +
+          scale_y_continuous(
+            limits = c(base_radius + lower_fold_limit, base_radius + upper_fold_limit + 1.65),
+            breaks = base_radius + y_breaks,
+            labels = y_breaks,
+            expand = expansion(mult = c(0, 0))
+          ) +
+                coord_polar(theta = "x") +
+                theme_bw() +
+                theme(
+                        axis.text.x = element_blank(),
+                        panel.grid.major.x = element_blank(),
+                        panel.grid.minor.x = element_blank(),
+                        panel.grid.major.y = element_blank(),
+                        panel.grid.minor.y = element_blank(),
+                        text = element_text(size = 14)
+                ) +
+                labs(
+                                        y = "Fold change (log2)",
+                        x = ""
+                )
+
+        print(p_circular)
+}
+```
 
