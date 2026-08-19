@@ -53,12 +53,83 @@ comparisons_file = config['COMPARISONS_FILE']
 plates_file = config['PLATES_FILE']
 samples_file = config['SAMPLES_FILE']
 demultiplex_dir = config['DEMULTIPLEX_DIRECTORY']
-viability_file = str(config.get("VIABILITY_FILE", "")).strip()
+viability_file_config = config.get("VIABILITY_FILE", "")
+viability_file = ",".join(str(path) for path in viability_file_config) if isinstance(viability_file_config, list) else str(viability_file_config).strip()
 normalize_counts = "TRUE" if config.get("NORMALIZE_COUNTS", True) else "FALSE"
+previous_tmp_primetime_dir = str(config.get("PREVIOUS_TMP_PRIMETIME_DIR", "")).strip()
+
+
+def config_bool(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    truthy = {"1", "true", "t", "yes", "y", "on"}
+    falsy = {"0", "false", "f", "no", "n", "off"}
+    if normalized in truthy:
+        return True
+    if normalized in falsy:
+        return False
+    raise ValueError(
+        f"Invalid boolean value '{value}' in config. Use one of: "
+        f"{sorted(truthy | falsy)}"
+    )
+
+
+run_demultiplexing = config_bool(config.get("RUN_DEMULTIPLEXING", True), default=True)
+reuse_previous_bc_counts = config_bool(config.get("REUSE_PREVIOUS_BC_COUNTS", False), default=False)
+
+
+def resolve_reused_rt_barcodes_dir(path_value):
+    if not path_value:
+        return ""
+
+    normalized = os.path.abspath(path_value)
+    if os.path.basename(os.path.normpath(normalized)) == "tmp_primetime":
+        return normalized
+    return os.path.join(normalized, "tmp_primetime")
+
+
+reused_rt_barcodes_base_dir = resolve_reused_rt_barcodes_dir(previous_tmp_primetime_dir)
+reuse_previous_rt_barcodes = bool(reused_rt_barcodes_base_dir)
+
+if reuse_previous_bc_counts and not reused_rt_barcodes_base_dir:
+    raise ValueError(
+        "REUSE_PREVIOUS_BC_COUNTS is True, but PREVIOUS_TMP_PRIMETIME_DIR is empty. "
+        "Set PREVIOUS_TMP_PRIMETIME_DIR to a previous run output (or tmp_primetime) directory."
+    )
+
+
+def rt_cluster_file_for_plate(plate_id):
+    if reuse_previous_rt_barcodes:
+        return os.path.join(reused_rt_barcodes_base_dir, f"rt_barcodes/{plate_id}.cluster.txt")
+    return os.path.join(output_dir, f"tmp_primetime/rt_barcodes/{plate_id}.cluster.txt")
 
 
 def demultiplex_completion_flag(plate_id):
     return os.path.join(demultiplex_dir, f".{plate_id}.demultiplex.complete")
+
+
+def demultiplex_outputs_complete(plate_id):
+    completion_flag = demultiplex_completion_flag(plate_id)
+    if os.path.exists(completion_flag):
+        return True
+
+    if plate_id == "pDNA":
+        expected_files = [os.path.join(demultiplex_dir, "pDNA.fastq.gz")]
+    else:
+        expected_files = [
+            os.path.join(demultiplex_dir, f"{plate_id}_{well}.fastq.gz")
+            for well in wells
+        ]
+    return all(os.path.exists(path) for path in expected_files)
+
+
+def demultiplex_rt_cluster_input(wildcards):
+    if demultiplex_outputs_complete(wildcards.plate_id):
+        return []
+    return ancient(rt_cluster_file_for_plate(wildcards.plate_id))
 
 
 def mark_completed_demultiplexing_outputs():
@@ -158,59 +229,124 @@ wells = df[0].tolist()
 plate_ids_to_use = list(plate_to_file.keys())
 mark_completed_demultiplexing_outputs()
 
-# Add a third column (index 2) with the fastq file path for each well ID in column 0
-# files will be named like: files_dir/demultiplex_<plate_id>_<well>.fastq.gz
-rows = []
-pdna_added = False
-for _, row in df.iterrows():
-    well = row.iloc[0]
-    sample = row.iloc[1]
+
+def validate_existing_demultiplexed_fastqs():
+    if run_demultiplexing:
+        return
+
+    missing_fastqs = []
     for plate_id in plate_ids_to_use:
-        # Special-case: pDNA is a single file (no well). The plates file contains the read1 path for pDNA
         if plate_id == "pDNA":
-            if not pdna_added:
-                path = plate_to_file.get("pDNA")
-                # sample name for pDNA is 'pDNA' and well is left empty
-                rows.append([None, "pDNA", path])
-                pdna_added = True
+            continue
+        for well in wells:
+            fastq_path = os.path.join(demultiplex_dir, f"{plate_id}_{well}.fastq.gz")
+            if not os.path.exists(fastq_path):
+                missing_fastqs.append(fastq_path)
+
+    if missing_fastqs:
+        example = "\n".join(missing_fastqs[:10])
+        remaining = len(missing_fastqs) - 10
+        if remaining > 0:
+            example += f"\n... and {remaining} more"
+        raise ValueError(
+            "RUN_DEMULTIPLEXING is False, but required demultiplexed FASTQ files are missing in "
+            f"{demultiplex_dir}:\n{example}"
+        )
+
+
+def validate_reused_rt_clusters():
+    if not run_demultiplexing or not reuse_previous_rt_barcodes:
+        return
+
+    missing_clusters = []
+    for plate_id in plate_ids_to_use:
+        if plate_id == "pDNA":
+            continue
+        cluster_path = rt_cluster_file_for_plate(plate_id)
+        if not os.path.exists(cluster_path):
+            missing_clusters.append(cluster_path)
+
+    if missing_clusters:
+        example = "\n".join(missing_clusters[:10])
+        remaining = len(missing_clusters) - 10
+        if remaining > 0:
+            example += f"\n... and {remaining} more"
+        raise ValueError(
+            "PREVIOUS_TMP_PRIMETIME_DIR was set, but required RT barcode cluster files are missing:\n"
+            f"{example}"
+        )
+
+
+validate_existing_demultiplexed_fastqs()
+validate_reused_rt_clusters()
+
+def build_sample_replicate_files(samples_df):
+    # Add a third column (index 2) with the fastq file path for each well ID in column 0.
+    # Optional: if samples_df has a third column (index 2), use it as a stable replicate ID.
+    rows = []
+    pdna_added = False
+    for _, row in samples_df.iterrows():
+        well = row.iloc[0]
+        sample = row.iloc[1]
+        explicit_replicate_id = ""
+        if len(row) > 2 and pd.notna(row.iloc[2]):
+            explicit_replicate_id = str(row.iloc[2]).strip()
+        for plate_id in plate_ids_to_use:
+            # Special-case: pDNA is a single file (no well). The plates file contains the read1 path for pDNA
+            if plate_id == "pDNA":
+                if not pdna_added:
+                    path = plate_to_file.get("pDNA")
+                    # sample name for pDNA is 'pDNA' and well is left empty
+                    rows.append([None, "pDNA", path, "1"])
+                    pdna_added = True
+            else:
+                path = os.path.join(demultiplex_dir, f"{plate_id}_{well}.fastq.gz")
+                rows.append([well, sample, path, explicit_replicate_id])
+
+    expanded_df = pd.DataFrame(rows).drop_duplicates().reset_index(drop=True)
+
+    # Sanity check: expected rows is num_wells * num_plates (but pDNA contributes 1 row, not num_wells)
+    num_wells = len(samples_df)
+    num_plates = len(plate_ids_to_use)
+    num_pDNA = 1 if "pDNA" in plate_ids_to_use else 0
+    expected_rows = num_wells * (num_plates - num_pDNA) + num_pDNA
+    if len(expanded_df) != expected_rows:
+        print(f"Generated {len(expanded_df)} rows ({num_wells} wells * {num_plates - num_pDNA} plates + {num_pDNA} pDNA)")
+
+    sample_replicate_files = {}
+    # Iterate the DataFrame rows and populate the sample -> replicate -> fastq mapping
+    for _, row in expanded_df.iterrows():
+        sample = str(row.iloc[1])
+        fastq = row.iloc[2]
+        explicit_replicate_id = str(row.iloc[3]).strip() if len(row) > 3 else ""
+
+        if sample not in sample_replicate_files:
+            sample_replicate_files[sample] = {}
+
+        if explicit_replicate_id:
+            replicate = explicit_replicate_id
+            if replicate in sample_replicate_files[sample] and sample_replicate_files[sample][replicate] != fastq:
+                numeric_replicates = [
+                    int(existing_replicate)
+                    for existing_replicate in sample_replicate_files[sample]
+                    if str(existing_replicate).isdigit()
+                ]
+                replicate = str(max(numeric_replicates, default=0) + 1)
+                while replicate in sample_replicate_files[sample]:
+                    replicate = str(int(replicate) + 1)
+            sample_replicate_files[sample][replicate] = fastq
+            continue
+
+        if sample not in sample_replicate_files:
+            sample_replicate_files[sample] = {'1': fastq}
         else:
-            path = os.path.join(demultiplex_dir, f"{plate_id}_{well}.fastq.gz")
-            rows.append([well, sample, path])
+            replicate = str(len(sample_replicate_files[sample]) + 1)
+            sample_replicate_files[sample][replicate] = fastq
 
-# Create a new DataFrame from the accumulated rows (do not overwrite `df` while iterating it), with unique entries
-df = pd.DataFrame(rows).drop_duplicates().reset_index(drop=True)
+    return sample_replicate_files
 
-# Sanity check: expected rows is num_wells * num_plates (but pDNA contributes 1 row, not num_wells)
-num_wells = len(pd.read_csv(samples_file, sep=",", header=None))
-num_plates = len(plate_ids_to_use)
-num_pDNA = 1 if "pDNA" in plate_ids_to_use else 0
-expected_rows = num_wells * (num_plates - num_pDNA) + num_pDNA
-if len(df) != expected_rows:
-    print(f"Generated {len(df)} rows ({num_wells} wells * {num_plates - num_pDNA} plates + {num_pDNA} pDNA)")
 
-sample_replicate_files = {}
-# Iterate the DataFrame rows and populate the sample -> replicate -> fastq mapping
-for _, row in df.iterrows():
-    # sample name is in column 1, fastq path in column 2
-    sample = str(row.iloc[1])
-    fastq = row.iloc[2]
-    well = row.iloc[0]  # well ID from column 0
-    # For multi-plate experiments, we need to track samples by well_replicate (e.g., DMSO_1 from plate rep1 vs rep2)
-    # Create a key that includes well number for non-pDNA samples
-    if sample == "pDNA":
-        # pDNA has no well, just use sample name
-        sample_key = sample
-    else:
-        # Extract well number from sample name (e.g., "DMSO_1" -> "1", "minRT_10" -> "10")
-        # Sample names should be like "DMSO_1", "DMSO_2", "minRT_1", etc.
-        sample_key = sample
-    # Now assign replicate based on how many FASTQ files this sample_key has
-    if sample_key not in sample_replicate_files:
-        sample_replicate_files[sample_key] = {'1': fastq}
-    else:
-        # Get the replicate number based on how many files of this sample_key are there
-        replicate = str(len(sample_replicate_files[sample_key]) + 1)
-        sample_replicate_files[sample_key][replicate] = fastq
+sample_replicate_files = build_sample_replicate_files(df)
 
 
 # Parse all the comparisons in the comparisons file
@@ -224,11 +360,29 @@ with open(comparisons_file, 'r') as f:
         comparisons_dict[ref_name] = row[1:]
 
 # Get the paths to the annotated dataframes (used in rule 'get_activity_and_qc_plots')
+bc_counts_base_dir = (
+    os.path.join(reused_rt_barcodes_base_dir, "bc_counts")
+    if reuse_previous_bc_counts
+    else os.path.join(output_dir, "tmp_primetime/bc_counts")
+)
+
 path_to_annotated_dfs = [
-    os.path.join(output_dir, f"tmp_primetime/bc_counts/{sample}_{replicate}.cluster.annotated.txt")
+    os.path.join(bc_counts_base_dir, f"{sample}_{replicate}.cluster.annotated.txt")
     for sample in sample_replicate_files
     for replicate in sample_replicate_files[sample]
 ]
+
+if reuse_previous_bc_counts:
+    missing_annotated_files = [path for path in path_to_annotated_dfs if not os.path.exists(path)]
+    if missing_annotated_files:
+        example = "\n".join(missing_annotated_files[:10])
+        remaining = len(missing_annotated_files) - 10
+        if remaining > 0:
+            example += f"\n... and {remaining} more"
+        raise ValueError(
+            "REUSE_PREVIOUS_BC_COUNTS is True, but required annotated barcode files are missing:\n"
+            f"{example}"
+        )
 
 # Create a wildcard constraint for plate_id to avoid ambiguity
 plate_id_pattern = "|".join(re.escape(p) for p in plate_ids_to_use)
@@ -269,69 +423,68 @@ rule all:
 # Get list of samples excluding pDNA (pDNA is a separate plate, not a sample)
 samples_excluding_pdna = [s for s in sample_replicate_files.keys() if s != "pDNA"]
 
-# 1a) Handle pDNA specially (just copy the file, no demultiplexing)
-rule demultiplex_pdna:
-    input:
-        r1=lambda wildcards: ancient(plate_to_file["pDNA"])
-    output:
-        fastq=os.path.join(demultiplex_dir, "pDNA.fastq.gz"),
-        done=demultiplex_completion_flag("pDNA")
-    shell:
-        """
-        if [[ -f {output.done} && -s {output.fastq} ]]; then
-            exit 0
-        fi
+if run_demultiplexing:
+    # 1a) Handle pDNA specially (just copy the file, no demultiplexing)
+    rule demultiplex_pdna:
+        input:
+            r1=lambda wildcards: ancient(plate_to_file["pDNA"])
+        output:
+            fastq=os.path.join(demultiplex_dir, "pDNA.fastq.gz"),
+            done=demultiplex_completion_flag("pDNA")
+        shell:
+            """
+            if [[ -f {output.done} && -s {output.fastq} ]]; then
+                exit 0
+            fi
 
-        cp {input.r1} {output.fastq}
+            cp {input.r1} {output.fastq}
+            touch {output.done}
+            """
+
+    # 1b) Demultiplex regular fastq plates
+    rule demultiplex_fastq:
+        input:
+            r1=lambda wildcards: ancient(plate_to_file[wildcards.plate_id]),
+            rt_cluster=demultiplex_rt_cluster_input
+        output:
+            fastq=[os.path.join(demultiplex_dir, f"{{plate_id}}_{well}.fastq.gz") for well in wells],
+            done=demultiplex_completion_flag("{plate_id}")
+        wildcard_constraints:
+            plate_id="(?!pDNA)" + plate_id_pattern
+        params:
+            script=os.path.join(screen_scripts_dir, "primetime_demultiplexing.py"),
+            rt_bc_upstream_seq=config["RT_BARCODE_UPSTREAM_SEQUENCE"],
+            bc_length=10,
+            max_mismatch=config["MAX_MISMATCH_DOWNSTREAM_SEQ"],
+            rt_barcode_map=config["RT_BARCODE_MAPPING_FILE"],
+            samples_file=samples_file,
+            out_base=demultiplex_dir,
+            plot_dir=os.path.join(output_dir, "primetime_QC"),
+        threads: 40
+        shell:
+            """
+            if [[ -f {output.done} ]]; then
+                exit 0
+            fi
+
+            python {params.script} \
+        --fastq_r2 {input.r1} \
+        --read1 {input.r1} \
+    --bc_length {params.bc_length} \
+    --rt_bc_upstream_seq {params.rt_bc_upstream_seq} \
+    --max_mismatch {params.max_mismatch} \
+    --threads {threads} \
+    --rt_barcode_map {params.rt_barcode_map} \
+    --samples_file {params.samples_file} \
+    --out_base {params.out_base} \
+    --plot_dir {params.plot_dir} \
+    --plate_id {wildcards.plate_id} \
+    --stats_file {output.done}.stats \
+    --invalid_bc_file {output.done}.invalid.txt \
+    --rt_cluster_file {input.rt_cluster}
+
         touch {output.done}
-        """
-
-# 1b) Demultiplex regular fastq plates
-rule demultiplex_fastq:
-    input:
-        r1=lambda wildcards: ancient(plate_to_file[wildcards.plate_id]),
-        rt_cluster=ancient(os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.cluster.txt"))
-    output:
-        fastq=[os.path.join(demultiplex_dir, f"{{plate_id}}_{well}.fastq.gz") for well in wells],
-        done=demultiplex_completion_flag("{plate_id}")
-    wildcard_constraints:
-        plate_id="(?!pDNA)" + plate_id_pattern
-    params:
-        script=os.path.join(screen_scripts_dir, "primetime_demultiplexing.py"),
-        rt_bc_upstream_seq=config["RT_BARCODE_UPSTREAM_SEQUENCE"],
-        bc_length=10,
-        max_mismatch=config["MAX_MISMATCH_DOWNSTREAM_SEQ"],
-        rt_barcode_map=config["RT_BARCODE_MAPPING_FILE"],
-        samples_file=samples_file,
-        out_base=demultiplex_dir,
-        plot_dir=os.path.join(output_dir, "primetime_QC"),
-    threads: 40
-    conda:
-        os.path.join(conda_envs_dir, "demultiplexing.yaml")
-    shell:
-        """
-        if [[ -f {output.done} ]]; then
-            exit 0
-        fi
-
-        python {params.script} \
-    --fastq_r2 {input.r1} \
-    --read1 {input.r1} \
---bc_length {params.bc_length} \
---rt_bc_upstream_seq {params.rt_bc_upstream_seq} \
---max_mismatch {params.max_mismatch} \
---threads {threads} \
---rt_barcode_map {params.rt_barcode_map} \
---samples_file {params.samples_file} \
---out_base {params.out_base} \
---plot_dir {params.plot_dir} \
---plate_id {wildcards.plate_id} \
---stats_file {output.done}.stats \
---invalid_bc_file {output.done}.invalid.txt \
---rt_cluster_file {input.rt_cluster}
-
-    touch {output.done}
-        """
+            """
 
 
 ##########################################################################################
@@ -351,8 +504,6 @@ rule get_barcode_counts:
         bc_downstream_seq=config["BARCODE_DOWNSTREAM_SEQUENCE"],
         max_mismatch=config["MAX_MISMATCH_DOWNSTREAM_SEQ"],
     threads: 40
-    conda:
-        os.path.join(conda_envs_dir, "test_bc_counts.yaml")
     shell:
         """
         python {params.script} \
@@ -381,8 +532,6 @@ rule cluster_barcodes:
     params:
         amount_spikes=10000,
         bc_annotation=config["BARCODE_ANNOTATION_FILE"],
-    conda:
-        os.path.join(conda_envs_dir, "starcode.yaml")
     threads: 20
     shell:
         """
@@ -430,9 +579,7 @@ rule annotate_barcodes:
     params:
         script=os.path.join(scripts_dir, "primetime_annotate_barcodes.R"),
         bc_annotation=config["BARCODE_ANNOTATION_FILE"],
-        amount_spikes=10000
-    conda:
-        os.path.join(conda_envs_dir, "r_plotting.yaml")
+        amount_spikes=10000,
     shell:
         """
         Rscript {params.script} \
@@ -461,8 +608,10 @@ rule get_activity_and_qc_plots:
         read_counts=os.path.join(output_dir, "primetime_QC/read_counts.pdf"),
         bc_counts=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
         control_bc_corr=os.path.join(output_dir, "primetime_QC/control_barcode_correlations.pdf"),
+        control_bc_neg_corr_stats=os.path.join(output_dir, "primetime_QC/control_barcode_residual_negative_correlation_stats.tsv"),
         viability_heatmap=os.path.join(output_dir, "primetime_QC/viability_well_heatmap.pdf"),
         viability_qc=os.path.join(output_dir, "primetime_QC/read_counts_vs_viability.pdf"),
+        viability_plate_correlations=os.path.join(output_dir, "primetime_QC/viability_plate_correlations.pdf"),
         bleedthrough=os.path.join(
             output_dir, "primetime_QC/bleedthrough_estimation.pdf"
         ),
@@ -472,16 +621,15 @@ rule get_activity_and_qc_plots:
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
         barcode_activity=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
+        read_count_summary=os.path.join(output_dir, "tmp_primetime/activity/read_count_per_sample.tsv"),
     params:
         script=os.path.join(scripts_dir, "primetime_get_activity_and_qc_plots.R"),
-        df_basedir=os.path.join(output_dir, "tmp_primetime/bc_counts"),
+        df_basedir=bc_counts_base_dir,
         expected_pdna_counts=config["EXPECTED_PDNA_COUNTS"],
         plots_basedir=os.path.join(output_dir, "primetime_QC/"),
         activity_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
         barcode_activity_output=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
         viability_file=viability_file,
-    conda:
-        os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
         """
         mkdir -p {params.plots_basedir}
@@ -518,13 +666,19 @@ rule run_comparative_analysis:
         pval_threshold=config["PVALUE_THRESHOLD"],
         plot_output_dir=os.path.join(output_dir, "primetime_results"),
         contrast_condition=lambda wildcards: wildcards.contrast,
+        contrast_replicates=lambda wildcards: ",".join(
+            f"{wildcards.contrast}_{replicate}"
+            for replicate in sorted(sample_replicate_files[wildcards.contrast])
+        ),
         num_replicates_contrast=lambda wildcards: len(sample_replicate_files[wildcards.contrast]),
         reference_condition=lambda wildcards: wildcards.ref,
+        reference_replicates=lambda wildcards: ",".join(
+            f"{wildcards.ref}_{replicate}"
+            for replicate in sorted(sample_replicate_files[wildcards.ref])
+        ),
         num_replicates_reference=lambda wildcards: len(sample_replicate_files[wildcards.ref]),
         split_by_promoter=config.get("SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER", True),
-        normalize=normalize_counts
-    conda:
-        os.path.join(conda_envs_dir, "comparative_analysis.yaml")
+        normalize=normalize_counts,
     threads: 1
     shell:
         """
@@ -534,8 +688,10 @@ rule run_comparative_analysis:
         --output {params.out_basedir} \
         --pval_threshold {params.pval_threshold} \
         --contrast_condition {params.contrast_condition} \
+        --contrast_replicates {params.contrast_replicates} \
         --num_replicates_contrast {params.num_replicates_contrast} \
         --reference_condition {params.reference_condition} \
+        --reference_replicates {params.reference_replicates} \
         --num_replicates_reference {params.num_replicates_reference} \
         --plot_output {params.plot_output_dir} \
         --split_by_promoter {params.split_by_promoter} \
@@ -544,68 +700,71 @@ rule run_comparative_analysis:
 
 ##########################################################################################
 
-# 1c) Extract RT barcodes per plate (from R2)
-rule extract_rt_barcodes:
-    input:
-        r2=lambda wildcards: plate_to_file[wildcards.plate_id]
-    output:
-        rt=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.counts.txt")
-    wildcard_constraints:
-        plate_id="(?!pDNA)" + plate_id_pattern
-    params:
-        script=os.path.join(screen_scripts_dir, "primetime_extract_rt_barcodes.py"),
-        rt_bc_upstream_seq=config["RT_BARCODE_UPSTREAM_SEQUENCE"],
-        bc_length=10,
-        max_mismatch=config["MAX_MISMATCH_DOWNSTREAM_SEQ"],
-    conda:
-        os.path.join(conda_envs_dir, "demultiplexing.yaml")
-    threads: 20
-    shell:
-        """
-        python {params.script} \
---fastq_r2 {input.r2} \
---bc_length {params.bc_length} \
---rt_bc_upstream_seq {params.rt_bc_upstream_seq} \
---max_mismatch {params.max_mismatch} \
---output {output.rt}
-        """
+if run_demultiplexing and not reuse_previous_rt_barcodes:
+    # 1c) Extract RT barcodes per plate (from R2)
+    rule extract_rt_barcodes:
+        input:
+            r2=lambda wildcards: plate_to_file[wildcards.plate_id]
+        output:
+            rt=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.counts.txt")
+        wildcard_constraints:
+            plate_id="(?!pDNA)" + plate_id_pattern
+        params:
+            script=os.path.join(screen_scripts_dir, "primetime_extract_rt_barcodes.py"),
+            rt_bc_upstream_seq=config["RT_BARCODE_UPSTREAM_SEQUENCE"],
+            bc_length=10,
+            max_mismatch=config["MAX_MISMATCH_DOWNSTREAM_SEQ"],
+        threads: 20
+        shell:
+            """
+            python {params.script} \
+    --fastq_r2 {input.r2} \
+    --bc_length {params.bc_length} \
+    --rt_bc_upstream_seq {params.rt_bc_upstream_seq} \
+    --max_mismatch {params.max_mismatch} \
+    --output {output.rt}
+            """
 
-# 1d) Cluster extracted RT barcodes with starcode and spike corrects
-rule cluster_rt_barcodes:
-    input:
-        rt=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.counts.txt"),
-        rt_map=config["RT_BARCODE_MAPPING_FILE"]
-    output:
-        clustered=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.cluster.txt"),
-        tmp=temp(os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.spikes.txt"))
-    wildcard_constraints:
-        plate_id="(?!pDNA)" + plate_id_pattern
-    params:
-        amount_spikes=10000
-    conda:
-        os.path.join(conda_envs_dir, "starcode.yaml")
-    threads: 20
-    shell:
-        """
-        # Generate spike barcodes from rt_barcode map with Python for robust CSV parsing and sanitization
-        python - {params.amount_spikes} {input.rt_map} {output.tmp} << 'PYEOF'
+    # 1d) Cluster extracted RT barcodes with starcode and spike corrects
+    rule cluster_rt_barcodes:
+        input:
+            rt=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.counts.txt"),
+            rt_map=config["RT_BARCODE_MAPPING_FILE"]
+        output:
+            clustered=os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.cluster.txt"),
+            tmp=temp(os.path.join(output_dir, "tmp_primetime/rt_barcodes/{plate_id}.spikes.txt"))
+        wildcard_constraints:
+            plate_id="(?!pDNA)" + plate_id_pattern
+        params:
+            amount_spikes=10000
+        threads: 20
+        shell:
+            """
+            # Generate spike barcodes from rt_barcode map with Python for robust CSV parsing and sanitization
+            python - {params.amount_spikes} {input.rt_map} {output.tmp} << 'PYEOF'
 import csv, sys
 n = int(sys.argv[1])
 in_path = sys.argv[2]
 out_path = sys.argv[3]
 with open(in_path, newline='') as fh, open(out_path, 'w') as fo:
+    comp = str.maketrans('ACGTNacgtn', 'TGCANtgcan')
+
+    def revcomp(seq):
+        return seq.translate(comp)[::-1].upper()
+
     r = csv.reader(fh)
     next(r, None)
     for row in r:
         if len(row) >= 2:
-            b = row[1].strip().strip(chr(34)).strip(chr(13))
+            b = row[1].strip().strip(chr(34)).strip(chr(13)).upper()
             if len(b) == 10 and set(b) <= set('ACGTN'):
+                b = revcomp(b)
                 for _ in range(n):
                     fo.write(b + chr(10))
 PYEOF
 
-        # Expand counts file (barcode\tcount) to sequence list using Python, with sanitization
-        python - {input.rt} << 'PYEOF' | cat - {output.tmp} | starcode --threads {threads} --print-clusters --quiet --dist 2 | sort -k1,1 > {output.clustered}
+            # Expand counts file (barcode\tcount) to sequence list using Python, with sanitization
+            python - {input.rt} << 'PYEOF' | cat - {output.tmp} | starcode --threads {threads} --print-clusters --quiet --dist 2 | sort -k1,1 > {output.clustered}
 import sys
 inp = sys.argv[1]
 with open(inp) as fh:
@@ -621,7 +780,7 @@ with open(inp) as fh:
                 for _ in range(cnt):
                     print(bc)
 PYEOF
-        """
+            """
 
 # 7) Get heatmap of all conditions
 rule get_heatmap_of_conditions:
@@ -630,18 +789,18 @@ rule get_heatmap_of_conditions:
             os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
-        )
+        ),
+        negative_correlation_stats=os.path.join(output_dir, "primetime_QC/control_barcode_residual_negative_correlation_stats.tsv"),
+        read_count_summary=os.path.join(output_dir, "tmp_primetime/activity/read_count_per_sample.tsv")
     output:
         os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
     params:
         r_script=os.path.join(scripts_dir, "primetime_get_heatmap_of_conditions.R"),
-    conda:
-        os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
         """
         FILELIST=$(mktemp)
         printf '%s\n' {input.results} > "$FILELIST"
-        Rscript {params.r_script} --results-file "$FILELIST" --output {output}
+        Rscript {params.r_script} --results-file "$FILELIST" --negative-correlation-stats {input.negative_correlation_stats} --read-count-summary {input.read_count_summary} --output {output}
         rm "$FILELIST"
         """
 
@@ -658,8 +817,6 @@ rule get_pca_plot:
         os.path.join(output_dir, "primetime_results/umap_conditions.pdf"),
     params:
         r_script=os.path.join(scripts_dir, "primetime_get_pca_plot.R"),
-    conda:
-        os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
         """
         FILELIST=$(mktemp)
@@ -683,8 +840,6 @@ rule get_tf_specific_plots:
         directory(os.path.join(output_dir, "primetime_results/tf_specific_plots"))
     params:
         r_script=os.path.join(screen_scripts_dir, "primetime_get_tf_specific_plots.R"),
-    conda:
-        os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
         """
         mkdir -p {output}
