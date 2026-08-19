@@ -49,7 +49,6 @@ output_dir = config["OUTPUT_DIRECTORY"]
 comparisons_file = config['COMPARISONS_FILE']
 samples_file = config['SAMPLES_FILE']
 normalize_counts = "TRUE" if config.get("NORMALIZE_COUNTS", True) else "FALSE"
-viability_file = str(config.get("VIABILITY_FILE", "")).strip()
 
 
 # Goodbye message
@@ -304,13 +303,14 @@ rule get_activity_and_qc_plots:
         read_counts=os.path.join(output_dir, "primetime_QC/read_counts.pdf"),
         bc_counts=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
         control_bc_corr=os.path.join(output_dir, "primetime_QC/control_barcode_correlations.pdf"),
-        viability_heatmap=os.path.join(output_dir, "primetime_QC/viability_well_heatmap.pdf"),
+        control_bc_neg_corr_stats=os.path.join(output_dir, "primetime_QC/control_barcode_residual_negative_correlation_stats.tsv"),
         bleedthrough=os.path.join(
             output_dir, "primetime_QC/bleedthrough_estimation.pdf"
         ),
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
         barcode_activity=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
+        read_count_summary=os.path.join(output_dir, "tmp_primetime/activity/read_count_per_sample.tsv"),
     params:
         script=os.path.join(scripts_dir, "primetime_get_activity_and_qc_plots.R"),
         df_basedir=os.path.join(output_dir, "tmp_primetime/bc_counts"),
@@ -318,18 +318,12 @@ rule get_activity_and_qc_plots:
         plots_basedir=os.path.join(output_dir, "primetime_QC/"),
         activity_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
         barcode_activity_output=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
-        viability_file=viability_file,
     conda:
         os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
         """
         mkdir -p {params.plots_basedir}
         mkdir -p {params.activity_basedir}
-
-        viability_args=()
-        if [[ -n "{params.viability_file}" ]]; then
-            viability_args+=(--viability_file "{params.viability_file}")
-        fi
 
         Rscript {params.script} \
         --list_of_annotated_files "{input}" \
@@ -338,8 +332,7 @@ rule get_activity_and_qc_plots:
         --activity_basedir {params.activity_basedir} \
         --expected_pdna {params.expected_pdna_counts} \
         --cdna_output {output.cDNA} \
-        --barcode_activity_output {params.barcode_activity_output} \
-        "${{viability_args[@]}}"
+        --barcode_activity_output {params.barcode_activity_output}
         """
 
 rule run_comparative_analysis:
@@ -425,11 +418,13 @@ rule get_bc_counts_for_top_tfs:
 
 rule get_heatmap_of_conditions:
     input:
-        expand(
+        results=expand(
             os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
-        )
+        ),
+        negative_correlation_stats=os.path.join(output_dir, "primetime_QC/control_barcode_residual_negative_correlation_stats.tsv"),
+        read_count_summary=os.path.join(output_dir, "tmp_primetime/activity/read_count_per_sample.tsv")
     output:
         os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
     params:
@@ -438,12 +433,14 @@ rule get_heatmap_of_conditions:
         os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
         """
-        if [ $(echo {input} | wc -w) -le 1 ]; then
+        if [ $(echo {input.results} | wc -w) -le 1 ]; then
             echo "Not enough input files for heatmap, skipping."; touch {output};
         else
-            results=$(echo {input} | tr ' ' ',')
+            results=$(echo {input.results} | tr ' ' ',')
             Rscript {params.script} \
             --results $results \
+            --negative-correlation-stats {input.negative_correlation_stats} \
+            --read-count-summary {input.read_count_summary} \
             --output {output} > /dev/null 2>&1
         fi
         """
