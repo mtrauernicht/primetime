@@ -1,4 +1,5 @@
 #!/usr/bin/env Rscript
+
 suppressPackageStartupMessages({
   library(optparse)
   library(data.table)
@@ -6,280 +7,175 @@ suppressPackageStartupMessages({
   library(tidyr)
   library(ggplot2)
   library(ggrepel)
-  library(ggthemes)
 })
 
 option_list <- list(
-  make_option(c("--results"), type = "character", help = "Comma-separated list of comparison result files"),
-  make_option(c("--results-file"), type = "character", dest = "results_file", help = "Path to file with newline-separated comparison result files"),
-  make_option(c("--bleedthrough"), type = "character", help = "Path to bleedthrough data file"),
-  make_option(c("--output"), type = "character", help = "Output PDF path for UMAP plot")
+  make_option(c("--results"), type = "character"),
+  make_option(c("--results-file"), type = "character", dest = "results_file"),
+  make_option(c("--output"), type = "character")
 )
+opt <- parse_args(OptionParser(option_list = option_list))
 
-opt_parser <- OptionParser(option_list = option_list)
-opt <- parse_args(opt_parser)
-
-if ((is.null(opt$results) && is.null(opt$results_file)) || is.null(opt$output)) {
-  print_help(opt_parser)
-  stop("Missing required arguments")
-}
-
-script_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
-script_path <- if (length(script_arg) > 0) sub("^--file=", "", script_arg[1]) else getwd()
-project_root <- dirname(dirname(normalizePath(script_path)))
-python_bin <- file.path(project_root, ".venv", "bin", "python")
-if (!file.exists(python_bin)) {
-  python_bin <- Sys.which("python")
-}
-
-write_placeholder_pdf <- function(path, message_line) {
-  pdf(path, width = 8, height = 4)
-  plot.new()
-  text(0.5, 0.6, "UMAP of TF Activities Across Conditions", cex = 1.2, font = 2)
-  text(0.5, 0.4, message_line, cex = 1)
-  invisible(dev.off())
+if (is.null(opt$output) || (is.null(opt$results) && is.null(opt$results_file))) {
+  stop("Missing required arguments: results and output")
 }
 
 result_files <- character(0)
-if (!is.null(opt$results)) {
+if (!is.null(opt$results) && nzchar(opt$results)) {
   result_files <- c(result_files, unlist(strsplit(opt$results, ",")))
 }
-if (!is.null(opt$results_file)) {
-  result_files <- c(result_files, trimws(readLines(opt$results_file, warn = FALSE)))
+if (!is.null(opt$results_file) && nzchar(opt$results_file)) {
+  if (!file.exists(opt$results_file)) stop("Results list file not found: ", opt$results_file)
+  result_files <- c(result_files, unlist(strsplit(paste(readLines(opt$results_file, warn = FALSE), collapse = "\n"), "[[:space:]]+")))
 }
-result_files <- unique(result_files[result_files != ""])
+result_files <- unique(trimws(result_files))
+result_files <- result_files[result_files != ""]
 
-condition_activity_df <- data.frame()
-reference_conditions <- character(0)
-primetime_logfc_df <- data.frame()
+empty_plot <- function(title, message_line) {
+  ggplot() +
+    annotate("text", x = 0, y = 0.2, label = title, fontface = "bold", size = 5) +
+    annotate("text", x = 0, y = -0.2, label = message_line, size = 4) +
+    xlim(-1, 1) + ylim(-1, 1) +
+    theme_void()
+}
 
-compute_umap_coords <- function(input_matrix, labels, python_exe) {
-  if (nrow(input_matrix) < 3 || ncol(input_matrix) < 2) {
-    return(NULL)
-  }
+comparison_parts <- function(path) {
+  pieces <- strsplit(sub("\\.txt$", "", basename(path)), "_vs_", fixed = TRUE)[[1]]
+  if (length(pieces) != 2 || any(pieces == "")) return(NULL)
+  list(contrast = pieces[1], reference = pieces[2])
+}
 
-  scaled_matrix <- scale(input_matrix)
-  scaled_matrix[is.na(scaled_matrix)] <- 0
-
-  input_file <- tempfile(fileext = ".tsv")
-  output_file <- tempfile(fileext = ".tsv")
-  write.table(
-    data.frame(label = labels, as.data.frame(scaled_matrix, check.names = FALSE)),
-    file = input_file,
-    sep = "\t",
-    quote = FALSE,
-    row.names = FALSE
+select_spread_labels <- function(coords, x_col, y_col, label_col) {
+  coords$display_label <- ""
+  if (nrow(coords) == 0) return(coords)
+  distances <- sqrt(
+    (coords[[x_col]] - mean(coords[[x_col]], na.rm = TRUE))^2 +
+    (coords[[y_col]] - mean(coords[[y_col]], na.rm = TRUE))^2
   )
-
-  python_code <- c(
-    "import csv, sys, numpy as np",
-    "from pathlib import Path",
-    "import umap",
-    "input_path = Path(sys.argv[1])",
-    "output_path = Path(sys.argv[2])",
-    "with input_path.open() as fh:",
-    "    reader = csv.reader(fh, delimiter='\\t')",
-    "    header = next(reader)",
-    "    rows = list(reader)",
-    "labels = [row[0] for row in rows]",
-    "matrix = np.array([[float(value) for value in row[1:]] for row in rows], dtype=float)",
-    "n_obs = matrix.shape[0]",
-    "n_neighbors = max(2, min(5, n_obs - 1))",
-    "reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=n_neighbors, min_dist=0.3)",
-    "coords = reducer.fit_transform(matrix)",
-    "with output_path.open('w', newline='') as fh:",
-    "    writer = csv.writer(fh, delimiter='\\t')",
-    "    writer.writerow(['label', 'UMAP1', 'UMAP2'])",
-    "    for label, (x, y) in zip(labels, coords):",
-    "        writer.writerow([label, x, y])"
-  )
-  py_script <- tempfile(fileext = ".py")
-  writeLines(python_code, py_script)
-
-  suppressWarnings(system2(python_exe, c(py_script, input_file, output_file), stdout = TRUE, stderr = TRUE))
-  if (!file.exists(output_file) || file.info(output_file)$size == 0) {
-    return(NULL)
-  }
-
-  coords <- suppressWarnings(read.table(output_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
-  if (nrow(coords) == 0 || !all(c("label", "UMAP1", "UMAP2") %in% colnames(coords))) {
-    return(NULL)
-  }
+  n_labels <- min(nrow(coords), max(10, ceiling(nrow(coords) * 0.6)), 60)
+  top_indices <- order(distances, decreasing = TRUE)[seq_len(n_labels)]
+  coords$display_label[top_indices] <- as.character(coords[[label_col]][top_indices])
   coords
 }
 
-select_spread_labels <- function(coords_df, x_col, y_col, label_col, min_labels = 10, frac_labels = 0.6, max_labels = 60) {
-  coords_df$display_label <- ""
-  if (nrow(coords_df) == 0) {
-    return(coords_df)
-  }
-  centroid_x <- mean(coords_df[[x_col]], na.rm = TRUE)
-  centroid_y <- mean(coords_df[[y_col]], na.rm = TRUE)
-  distances <- sqrt((coords_df[[x_col]] - centroid_x)^2 + (coords_df[[y_col]] - centroid_y)^2)
-  n_to_label <- min(nrow(coords_df), max(min_labels, ceiling(nrow(coords_df) * frac_labels), na.rm = TRUE), max_labels)
-  top_idx <- order(distances, decreasing = TRUE)[seq_len(n_to_label)]
-  coords_df$display_label[top_idx] <- as.character(coords_df[[label_col]][top_idx])
-  coords_df
+plot_scores <- function(scores, x_col, y_col, title, x_label, y_label) {
+  scores <- select_spread_labels(scores, x_col, y_col, "label")
+  scores$status <- ifelse(grepl("control|ctrl|dmso", tolower(scores$label)), "Control", "Sample")
+  ggplot(scores, aes_string(x = x_col, y = y_col, color = "status")) +
+    geom_point(size = 3.5) +
+    geom_text_repel(
+      data = subset(scores, display_label != ""), aes(label = display_label),
+      size = 2.8, max.overlaps = Inf, force = 1, box.padding = 0.3,
+      point.padding = 0.1, segment.alpha = 0.5, min.segment.length = 0
+    ) +
+    scale_color_manual(values = c("Control" = "#f37f80", "Sample" = "#6495ed"), name = NULL) +
+    labs(title = title, x = x_label, y = y_label) +
+    theme_bw() +
+    theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5, face = "bold"))
 }
 
-for (this_file in result_files) {
-  if (!file.exists(this_file) || file.info(this_file)$size == 0) {
-    next
-  }
-
-  file_base <- sub("\\.txt$", "", basename(this_file))
-  comparison_parts <- strsplit(file_base, "_vs_")[[1]]
-  if (length(comparison_parts) != 2) {
-    next
-  }
-
-  ref_condition <- comparison_parts[2]
-  contrast_condition <- comparison_parts[1]
-  comparison_df <- suppressWarnings(read.table(this_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE))
-  if (!all(c("tf", ref_condition, contrast_condition) %in% colnames(comparison_df))) {
-    next
-  }
-
-  if (all(c("tf", "logFC") %in% colnames(comparison_df))) {
-    comparison_label <- paste0(contrast_condition, " vs ", ref_condition)
-    comparison_df %>%
-      select(tf, logFC) %>%
-      mutate(
-        logFC = as.numeric(logFC),
-        comparison = comparison_label,
-        reference_condition = ref_condition
-      ) %>%
-      filter(!grepl("^RANDOM", tf)) %>%
-      as.data.frame() -> new_logfc_df
-    primetime_logfc_df <- bind_rows(primetime_logfc_df, new_logfc_df)
-  }
-
-  comparison_df %>%
-    select(tf, all_of(c(ref_condition, contrast_condition))) %>%
-    pivot_longer(cols = all_of(c(ref_condition, contrast_condition)), names_to = "condition", values_to = "activity") %>%
-    mutate(activity = as.numeric(activity)) %>%
-    filter(!grepl("^RANDOM", tf)) %>%
-    group_by(condition, tf) %>%
-    summarise(activity = mean(activity, na.rm = TRUE), .groups = "drop") %>%
-    as.data.frame() -> new_df
-
-  condition_activity_df <- bind_rows(condition_activity_df, new_df)
-  reference_conditions <- c(reference_conditions, ref_condition)
+build_matrix <- function(rows) {
+  if (length(rows) == 0) return(NULL)
+  combined <- rbindlist(rows, fill = TRUE)
+  combined <- combined[is.finite(value)]
+  if (nrow(combined) == 0) return(NULL)
+  combined <- combined[, .(value = mean(value, na.rm = TRUE)), by = .(condition, tf)]
+  wide <- dcast(combined, condition ~ tf, value.var = "value", fill = 0)
+  if (nrow(wide) < 2 || ncol(wide) < 3) return(NULL)
+  matrix_values <- as.matrix(wide[, -1, with = FALSE])
+  rownames(matrix_values) <- wide$condition
+  variable_columns <- apply(matrix_values, 2, function(values) sd(values, na.rm = TRUE) > 0)
+  if (sum(variable_columns) < 2) return(NULL)
+  matrix_values[, variable_columns, drop = FALSE]
 }
 
-plots_to_print <- list()
+pca_plot <- function(matrix_values, title) {
+  if (is.null(matrix_values) || nrow(matrix_values) < 2 || ncol(matrix_values) < 2) {
+    return(empty_plot(title, "Insufficient variable data for PCA"))
+  }
+  pca <- tryCatch(prcomp(matrix_values, scale. = TRUE, center = TRUE), error = function(e) NULL)
+  if (is.null(pca) || ncol(pca$x) < 2) return(empty_plot(title, "PCA could not be computed"))
+  scores <- as.data.frame(pca$x[, 1:2, drop = FALSE])
+  scores$label <- rownames(scores)
+  variance <- summary(pca)$importance[2, 1:2] * 100
+  plot_scores(scores, "PC1", "PC2", title,
+              sprintf("PC1 (%.1f%% variance)", variance[1]),
+              sprintf("PC2 (%.1f%% variance)", variance[2]))
+}
 
-output_root <- dirname(dirname(normalizePath(opt$output, mustWork = FALSE)))
-barcode_activity_path <- file.path(output_root, "tmp_primetime", "activity", "barcode_activity.txt")
+compute_umap <- function(matrix_values) {
+  if (is.null(matrix_values) || nrow(matrix_values) < 3 || ncol(matrix_values) < 2) return(NULL)
+  script_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
+  script_path <- if (length(script_arg) > 0) sub("^--file=", "", script_arg[1]) else getwd()
+  project_root <- dirname(dirname(normalizePath(script_path)))
+  python_bin <- file.path(project_root, ".venv", "bin", "python")
+  if (!file.exists(python_bin)) python_bin <- Sys.which("python")
+  if (!nzchar(python_bin)) return(NULL)
 
+  input_file <- tempfile(fileext = ".tsv")
+  output_file <- tempfile(fileext = ".tsv")
+  write.table(data.frame(label = rownames(matrix_values), scale(matrix_values)), input_file,
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  python_code <- paste(
+    "import csv, sys, numpy as np, umap",
+    "rows = list(csv.reader(open(sys.argv[1]), delimiter='\\t'))",
+    "labels = [row[0] for row in rows[1:]]",
+    "matrix = np.array([[float(x) for x in row[1:]] for row in rows[1:]])",
+    "coords = umap.UMAP(n_components=2, random_state=42, n_neighbors=max(2, min(5, len(labels)-1)), min_dist=0.3).fit_transform(matrix)",
+    "writer = csv.writer(open(sys.argv[2], 'w', newline=''), delimiter='\\t')",
+    "writer.writerow(['label', 'UMAP1', 'UMAP2'])",
+    "writer.writerows([[label, x, y] for label, (x, y) in zip(labels, coords)])",
+    sep = "\n"
+  )
+  python_file <- tempfile(fileext = ".py")
+  writeLines(python_code, python_file)
+  suppressWarnings(system2(python_bin, c(python_file, input_file, output_file), stdout = TRUE, stderr = TRUE))
+  if (!file.exists(output_file) || file.info(output_file)$size == 0) return(NULL)
+  tryCatch(read.delim(output_file, check.names = FALSE), error = function(e) NULL)
+}
+
+activity_rows <- list()
+for (path in result_files) {
+  if (!file.exists(path) || file.info(path)$size == 0) next
+  parts <- comparison_parts(path)
+  if (is.null(parts)) next
+  data <- tryCatch(fread(path, header = TRUE, na.strings = c("", "NA")), error = function(e) NULL)
+  if (is.null(data) || !"tf" %in% names(data)) next
+  data <- data[!grepl("^RANDOM", tf)]
+  for (condition in c(parts$reference, parts$contrast)) {
+    if (condition %in% names(data)) {
+      activity_rows[[length(activity_rows) + 1]] <- data.table(tf = data$tf, condition = condition, value = as.numeric(data[[condition]]))
+    }
+  }
+}
+activity_matrix <- build_matrix(activity_rows)
+
+barcode_activity_path <- file.path(dirname(dirname(normalizePath(opt$output, mustWork = FALSE))), "tmp_primetime", "activity", "barcode_activity.txt")
+barcode_matrix <- NULL
 if (file.exists(barcode_activity_path) && file.info(barcode_activity_path)$size > 0) {
-  qc_df <- suppressWarnings(read.table(barcode_activity_path, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE))
-  if (all(c("cDNA_sample", "tf") %in% colnames(qc_df))) {
-    if (!"log2_mean_RPM" %in% colnames(qc_df) && "mean_RPM" %in% colnames(qc_df)) {
-      qc_df$log2_mean_RPM <- log2(as.numeric(qc_df$mean_RPM) + 1)
-    }
-    if ("log2_mean_RPM" %in% colnames(qc_df)) {
-      sample_activity_df <- qc_df %>%
-        filter(!grepl("^RANDOM", tf)) %>%
-        mutate(log2_mean_RPM = as.numeric(log2_mean_RPM)) %>%
-        group_by(cDNA_sample, tf) %>%
-        summarise(activity = mean(log2_mean_RPM, na.rm = TRUE), .groups = "drop")
-
-      sample_wide <- sample_activity_df %>%
-        pivot_wider(names_from = tf, values_from = activity) %>%
-        arrange(cDNA_sample)
-
-      sample_names <- sample_wide$cDNA_sample
-      sample_matrix <- sample_wide %>% select(-cDNA_sample) %>% as.matrix()
-      rownames(sample_matrix) <- sample_names
-
-      valid_sample_cols <- apply(sample_matrix, 2, function(x) !all(is.na(x)) && sd(x, na.rm = TRUE) > 0)
-      sample_matrix <- sample_matrix[, valid_sample_cols, drop = FALSE]
-      sample_matrix <- sample_matrix[complete.cases(sample_matrix), , drop = FALSE]
-
-      coords_samples <- compute_umap_coords(sample_matrix, rownames(sample_matrix), python_bin)
-      if (!is.null(coords_samples)) {
-        coords_samples$status <- ifelse(grepl("control|ctrl|dmso", tolower(coords_samples$label)), "Control", "Sample")
-        coords_samples$label <- factor(coords_samples$label, levels = coords_samples$label[order(coords_samples$UMAP1, coords_samples$UMAP2)])
-        coords_samples <- select_spread_labels(coords_samples, "UMAP1", "UMAP2", "label")
-
-        p_samples <- ggplot(coords_samples, aes(x = UMAP1, y = UMAP2, color = status)) +
-          geom_point(size = 3.5) +
-          geom_text_repel(
-            data = subset(coords_samples, display_label != ""),
-            aes(label = display_label),
-            size = 2.8,
-            max.overlaps = Inf,
-            force = 1,
-            box.padding = 0.3,
-            point.padding = 0.1,
-            segment.alpha = 0.5,
-            min.segment.length = 0
-          ) +
-          scale_color_manual(values = c("Control" = "#f37f80", "Sample" = "#6495ed"), name = NULL) +
-          theme_bw() +
-          labs(
-            title = "UMAP of Individual Sample Activities (QC Barcode Activity)",
-            x = "UMAP 1",
-            y = "UMAP 2"
-          ) +
-          theme(
-            legend.position = "bottom",
-            plot.title = element_text(hjust = 0.5, face = "bold")
-          )
-        plots_to_print[[length(plots_to_print) + 1]] <- p_samples
-
-        pca_result <- tryCatch(
-          prcomp(scale(sample_matrix), center = FALSE, scale. = FALSE),
-          error = function(e) NULL
-        )
-
-        if (!is.null(pca_result) && ncol(pca_result$x) >= 2) {
-          pca_scores <- as.data.frame(pca_result$x[, 1:2, drop = FALSE])
-          colnames(pca_scores) <- c("PC1", "PC2")
-          pca_scores$label <- rownames(pca_scores)
-          pca_scores$status <- ifelse(grepl("control|ctrl|dmso", tolower(pca_scores$label)), "Control", "Sample")
-          pca_scores <- select_spread_labels(pca_scores, "PC1", "PC2", "label")
-
-          var_explained <- summary(pca_result)$importance[2, 1:2] * 100
-          p_pca <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = status)) +
-            geom_point(size = 3.5) +
-            geom_text_repel(
-              data = subset(pca_scores, display_label != ""),
-              aes(label = display_label),
-              size = 2.8,
-              max.overlaps = Inf,
-              force = 1,
-              box.padding = 0.3,
-              point.padding = 0.1,
-              segment.alpha = 0.5,
-              min.segment.length = 0
-            ) +
-            scale_color_manual(values = c("Control" = "#f37f80", "Sample" = "#6495ed"), name = NULL) +
-            theme_bw() +
-            labs(
-              title = "PCA of Individual Sample Activities (QC Barcode Activity)",
-              x = paste0("PC1 (", sprintf("%.1f", var_explained[1]), "%)"),
-              y = paste0("PC2 (", sprintf("%.1f", var_explained[2]), "%)")
-            ) +
-            theme(
-              legend.position = "bottom",
-              plot.title = element_text(hjust = 0.5, face = "bold")
-            )
-          plots_to_print[[length(plots_to_print) + 1]] <- p_pca
-        }
-      }
+  barcode_data <- tryCatch(fread(barcode_activity_path), error = function(e) NULL)
+  if (!is.null(barcode_data) && all(c("cDNA_sample", "tf") %in% names(barcode_data))) {
+    value_column <- if ("log2_mean_RPM" %in% names(barcode_data)) "log2_mean_RPM" else if ("mean_RPM" %in% names(barcode_data)) "mean_RPM" else NULL
+    if (!is.null(value_column)) {
+      barcode_data <- barcode_data[!grepl("^RANDOM", tf)]
+      barcode_data[, value := as.numeric(get(value_column))]
+      if (value_column == "mean_RPM") barcode_data[, value := log2(value + 1)]
+      barcode_matrix <- build_matrix(list(data.table(tf = barcode_data$tf, condition = barcode_data$cDNA_sample, value = barcode_data$value)))
     }
   }
 }
 
-if (length(plots_to_print) == 0) {
-  write_placeholder_pdf(opt$output, "No valid activity matrix could be constructed")
-  quit(status = 0)
+umap_coords <- compute_umap(barcode_matrix)
+umap_panel <- if (is.null(umap_coords)) {
+  empty_plot("UMAP of Individual Sample Activities", "UMAP requires at least three samples and the Python umap package")
+} else {
+  plot_scores(umap_coords, "UMAP1", "UMAP2", "UMAP of Individual Sample Activities", "UMAP 1", "UMAP 2")
 }
 
 pdf(opt$output, width = 8, height = 6)
-for (this_plot in plots_to_print) {
-  print(this_plot)
-}
-invisible(dev.off())
+for (plot in list(
+  umap_panel,
+  pca_plot(barcode_matrix, "PCA of Individual Sample Activities"),
+  pca_plot(activity_matrix, "PCA of Primetime-Computed Activities")
+)) print(plot)
+dev.off()
