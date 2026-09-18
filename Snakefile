@@ -49,6 +49,7 @@ output_dir = config["OUTPUT_DIRECTORY"]
 comparisons_file = config['COMPARISONS_FILE']
 samples_file = config['SAMPLES_FILE']
 normalize_counts = "TRUE" if config.get("NORMALIZE_COUNTS", True) else "FALSE"
+banana_correction = "TRUE" if config.get("BANANA_CORRECTION", True) else "FALSE"
 
 
 # Goodbye message
@@ -303,7 +304,6 @@ rule get_activity_and_qc_plots:
         read_counts=os.path.join(output_dir, "primetime_QC/read_counts.pdf"),
         bc_counts=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
         control_bc_corr=os.path.join(output_dir, "primetime_QC/control_barcode_correlations.pdf"),
-        control_bc_neg_corr_stats=os.path.join(output_dir, "primetime_QC/control_barcode_residual_negative_correlation_stats.tsv"),
         bleedthrough=os.path.join(
             output_dir, "primetime_QC/bleedthrough_estimation.pdf"
         ),
@@ -318,6 +318,7 @@ rule get_activity_and_qc_plots:
         plots_basedir=os.path.join(output_dir, "primetime_QC/"),
         activity_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
         barcode_activity_output=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
+        banana_correction=banana_correction,
     conda:
         os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
@@ -332,7 +333,8 @@ rule get_activity_and_qc_plots:
         --activity_basedir {params.activity_basedir} \
         --expected_pdna {params.expected_pdna_counts} \
         --cdna_output {output.cDNA} \
-        --barcode_activity_output {params.barcode_activity_output}
+        --barcode_activity_output {params.barcode_activity_output} \
+        --banana_correction {params.banana_correction}
         """
 
 rule run_comparative_analysis:
@@ -353,8 +355,8 @@ rule run_comparative_analysis:
         num_replicates_contrast=lambda wildcards: len(sample_replicate_files[wildcards.contrast]),
         reference_condition=lambda wildcards: wildcards.ref,
         num_replicates_reference=lambda wildcards: len(sample_replicate_files[wildcards.ref]),
-        split_by_promoter=config.get("SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER", True),
-        normalize=normalize_counts
+        normalize=normalize_counts,
+        banana_correction=banana_correction
     conda:
         os.path.join(conda_envs_dir, "comparative_analysis.yaml")
     threads: 1
@@ -370,8 +372,8 @@ rule run_comparative_analysis:
         --reference_condition {params.reference_condition} \
         --num_replicates_reference {params.num_replicates_reference} \
         --plot_output {params.plot_output_dir} \
-        --split_by_promoter {params.split_by_promoter} \
-        --normalize {params.normalize}
+        --normalize {params.normalize} \
+        --banana_correction {params.banana_correction}
         """
 
 ##########################################################################################
@@ -423,7 +425,6 @@ rule get_heatmap_of_conditions:
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ),
-        negative_correlation_stats=os.path.join(output_dir, "primetime_QC/control_barcode_residual_negative_correlation_stats.tsv"),
         read_count_summary=os.path.join(output_dir, "tmp_primetime/activity/read_count_per_sample.tsv")
     output:
         os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
@@ -439,7 +440,6 @@ rule get_heatmap_of_conditions:
             results=$(echo {input.results} | tr ' ' ',')
             Rscript {params.script} \
             --results $results \
-            --negative-correlation-stats {input.negative_correlation_stats} \
             --read-count-summary {input.read_count_summary} \
             --output {output} > /dev/null 2>&1
         fi
