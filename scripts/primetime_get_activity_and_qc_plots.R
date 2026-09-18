@@ -39,11 +39,13 @@ option_list <- list(
     make_option(c("--list_of_annotated_files"), help = "Path to all annotated files separated by commas", type = "character"),
     make_option(c("--plots_basedir"), type = "character", help = "Basedir for the plots"),
     make_option(c("--activity_basedir"), type = "character", help = "Basedir for the MPRAnalyze files"),
-    make_option(c("--design"), type = "character", help = "Design DF with sample names"),
+    make_option(c("--design"), type = "character", help = "Comma-separated list of design (SAMPLES_FILE) CSVs with sample/well names, one per plate, in plate order"),
     make_option(c("--expected_pdna"), type = "character", help = "Path to expected pDNA counts"),
     make_option(c("--cdna_output"), type = "character", help = "Path to save the cDNA counts for MPRAnalyze"),
     make_option(c("--barcode_activity_output"), type = "character", help = "Path to save barcode-level activity used for barcode correlations"),
-    make_option(c("--viability_file"), type = "character", default = "", help = "Optional comma-separated viability matrix files")
+    make_option(c("--viability_file"), type = "character", default = "", help = "Optional comma-separated viability matrix files"),
+    make_option(c("--comparisons"), type = "character", default = "", help = "Tab-delimited reference-to-contrast comparison file"),
+    make_option(c("--banana_correction"), type = "logical", default = TRUE, help = "Whether to apply the banana-shaped bias correction (loess sample-to-control normalization) to barcode activity")
 )
 
 # Functions for the plots
@@ -100,9 +102,18 @@ upper_diag_plot <- function(data, mapping, color = I("black"), sizeRange = c(1, 
 
 
 lower_diag_plot <- function(data, mapping, ...) {
-    ggally_points(data = data, mapping = mapping, alpha = 0.5, size = 0.7) +
-        geom_abline(slope = 1, lty = "dashed", col = "red") +
-        theme_pubr(border = T)
+    ggplot(data = data, mapping = mapping) +
+        geom_point(
+            alpha = 0.5,
+            size = 0.7,
+            ...
+        ) +
+        geom_abline(
+            slope = 1,
+            lty = "dashed",
+            col = "red"
+        ) +
+        theme_pubr(border = TRUE)
 }
 
 diag_plot <- function(data, mapping, ...) {
@@ -152,7 +163,7 @@ read_viability_matrix <- function(path) {
     viability_long
 }
 
-read_design_map <- function(path) {
+read_single_design_map <- function(path) {
     if (is.null(path) || !nzchar(trimws(path)) || !file.exists(path) || file.info(path)$size == 0) {
         return(NULL)
     }
@@ -212,12 +223,67 @@ read_design_map <- function(path) {
         distinct(sample, well, .keep_all = TRUE)
 }
 
+# opt$design may hold a comma-separated list of per-plate design files (one per plate,
+# in the same order as the plates/viability matrices); each gets tagged with plate_index
+# so wells can be resolved per plate instead of only by sample name.
+read_design_map <- function(paths) {
+    paths <- trimws(unlist(strsplit(paths, ",")))
+    paths <- paths[nzchar(paths)]
+    if (length(paths) == 0) {
+        return(NULL)
+    }
+
+    design_maps <- purrr::imap(paths, function(path, idx) {
+        design_map <- read_single_design_map(path)
+        if (!is.null(design_map)) {
+            design_map$plate_index <- idx
+        }
+        design_map
+    })
+    design_maps <- design_maps[!vapply(design_maps, is.null, logical(1))]
+    if (length(design_maps) == 0) {
+        return(NULL)
+    }
+
+    bind_rows(design_maps)
+}
+
+# Loess-corrects the sample channel toward a fixed reference/control channel (per comparison
+# group), pulling barcodes off the MA banana back onto the y=x diagonal. Unlike a symmetric
+# MA correction, the control side is left untouched since it's the anchor.
+correct_banana_to_control <- function(df, sample_col, control_col, span = 0.75) {
+    df <- df %>%
+        mutate(
+            A = (.data[[sample_col]] + .data[[control_col]]) / 2,
+            M = .data[[sample_col]] - .data[[control_col]]
+        )
+
+    n_unique_A <- n_distinct(df$A[is.finite(df$A)])
+    fit <- if (nrow(df) >= 10 && n_unique_A >= 5) {
+        tryCatch(loess(M ~ A, data = df, span = span, degree = 2), error = function(e) NULL)
+    } else {
+        NULL
+    }
+
+    if (is.null(fit)) {
+        df$M_fitted <- 0
+    } else {
+        df$M_fitted <- predict(fit, newdata = df)
+        df$M_fitted[!is.finite(df$M_fitted)] <- 0
+    }
+
+    df$M_corrected <- df$M - df$M_fitted
+    df[[paste0(sample_col, "_corrected")]] <- df[[control_col]] + df$M_corrected
+    df %>% select(-A, -M, -M_fitted, -M_corrected)
+}
+
 ##########################################################################################
 ## Start of the script ###################################################################
 ##########################################################################################
 
 opt_parser <- OptionParser(option_list = option_list)
 opt <- parse_args(opt_parser)
+banana_correction <- isTRUE(opt$banana_correction)
 
 if (!is.null(opt$plots_basedir) && nzchar(opt$plots_basedir)) {
     dir.create(opt$plots_basedir, recursive = TRUE, showWarnings = FALSE)
@@ -235,17 +301,39 @@ list_of_annotated_files <- trimws(list_of_annotated_files)
 list_of_annotated_files <- list_of_annotated_files[list_of_annotated_files != ""]
 unique_files <- unique(list_of_annotated_files)
 
+# Each line is either "path" (legacy) or "path|||sample|||replicate" (manifest form, used when
+# plate IDs embedded in filenames contain underscores and would otherwise be ambiguous).
+parse_annotated_entry <- function(entry) {
+    parts <- strsplit(entry, "|||", fixed = TRUE)[[1]]
+    if (length(parts) == 3) {
+        return(list(path = parts[1], sample = parts[2], replicate = parts[3]))
+    }
+    list(path = entry, sample = NA_character_, replicate = NA_character_)
+}
+
 counts_df = data.frame()
-for(l in unique_files){
-    # message("- Processing file ", l)
-    basename = tools::file_path_sans_ext(basename(l))
-    # Remove the .cluster.annotated part from the end
-    sample_plus_replicate = sub("\\.cluster\\.annotated$", "", basename)
-    # Split at last underscore to get sample and replicate
-    underscore_pos = max(unlist(gregexpr("_", sample_plus_replicate)))
-    this_sample = substr(sample_plus_replicate, 1, underscore_pos - 1)
-    replicate = substr(sample_plus_replicate, underscore_pos + 1, nchar(sample_plus_replicate))
-    this_replicate = paste(this_sample, replicate, sep = "_")
+for(entry in unique_files){
+    parsed_entry <- parse_annotated_entry(entry)
+    l <- parsed_entry$path
+    if (!is.na(parsed_entry$sample) && !is.na(parsed_entry$replicate)) {
+        this_sample <- parsed_entry$sample
+        this_replicate <- parsed_entry$replicate
+    } else {
+        # message("- Processing file ", l)
+        basename = tools::file_path_sans_ext(basename(l))
+        # Remove the .cluster.annotated part from the end
+        sample_plus_replicate = sub("\\.cluster\\.annotated$", "", basename)
+        # Split at last underscore to get sample and replicate
+        underscore_pos = max(unlist(gregexpr("_", sample_plus_replicate)))
+        is_pDNA_file = grepl("^pDNA_", sample_plus_replicate)
+        this_sample = if (is_pDNA_file) "pDNA" else substr(sample_plus_replicate, 1, underscore_pos - 1)
+        replicate = if (is_pDNA_file) {
+            sub("^pDNA_", "", sample_plus_replicate)
+        } else {
+            substr(sample_plus_replicate, underscore_pos + 1, nchar(sample_plus_replicate))
+        }
+        this_replicate = paste(this_sample, replicate, sep = "_")
+    }
     this_replicate_df <- read.table(l, header = TRUE, sep = "\t")
     count_col <- if ("count" %in% colnames(this_replicate_df)) {
         "count"
@@ -559,7 +647,7 @@ read_count_summary_df <- counts_df %>%
     select(replicate, sample, total_read_count) %>%
     distinct() %>%
     mutate(
-        condition = sub("_[0-9]+$", "", replicate),
+        condition = sample,
         read_count_lt_25000 = total_read_count < 25000
     )
 
@@ -655,8 +743,9 @@ if (length(viability_matrices) > 0) {
     }
 
     if (!is.null(design_map)) {
+        design_join_cols <- if ("plate_index" %in% names(design_map)) c("sample", "plate_index") else "sample"
         read_count_wells_df <- read_count_wells_df %>%
-            inner_join(design_map, by = "sample") %>%
+            inner_join(design_map, by = design_join_cols) %>%
             distinct(plate_index, well, .keep_all = TRUE)
         message("==== Viability design map rows: ", nrow(design_map))
     } else {
@@ -681,6 +770,17 @@ if (length(viability_matrices) > 0) {
             viability_rel_dmso = viability / dmso_mean_viability
         ) %>%
         ungroup()
+
+    viability_read_count_df %>%
+        group_by(sample) %>%
+        summarise(mean_viability = mean(viability, na.rm = TRUE), .groups = "drop") %>%
+        filter(is.finite(mean_viability)) %>%
+        write.table(
+            file = file.path(opt$activity_basedir, "sample_viability_summary.tsv"),
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE
+        )
 
     message("==== Plotting read count versus viability")
     pdf(file.path(opt$plots_basedir, "read_counts_vs_viability.pdf"), width = 8, height = 6)
@@ -797,6 +897,13 @@ if (length(viability_matrices) > 0) {
     invisible(dev.off())
 } else {
     message("==== No viability file provided or file missing; writing placeholder viability QC PDFs")
+    write.table(
+        data.frame(sample = character(0), mean_viability = numeric(0)),
+        file = file.path(opt$activity_basedir, "sample_viability_summary.tsv"),
+        sep = "\t",
+        row.names = FALSE,
+        quote = FALSE
+    )
     for (output_file in c("viability_well_heatmap.pdf", "read_counts_vs_viability.pdf", "viability_plate_correlations.pdf")) {
         pdf(file.path(opt$plots_basedir, output_file), width = 8, height = 6)
         plot.new()
@@ -839,7 +946,7 @@ order_of_samples =
     pull(sample)
 
 for (smp in order_of_samples) {
-    message("----- ploting ", smp)
+    message("----- plotting ", smp)
     df <- bleed_through_slope_df %>%
         filter(sample == smp) %>%
         distinct()
@@ -930,7 +1037,7 @@ for (this_cdna_sample in cdna_sample) {
 
 summarise_barcode_activity <- function(df) {
     df %>%
-        filter(!negative_control) %>%
+        #filter(!negative_control) %>%
         group_by(cDNA_sample, barcode, tf, promoter) %>%
         summarise(
             mean_RPM = mean(activity_RPM),
@@ -939,17 +1046,19 @@ summarise_barcode_activity <- function(df) {
         )
 }
 
+replicate_condition_lookup <- counts_df %>%
+    filter(!pDNA) %>%
+    distinct(replicate, sample) %>%
+    rename(cDNA_sample = replicate, condition = sample)
+
 control_condition <-
-    all_cdna_conditions[str_detect(str_to_lower(all_cdna_conditions), "control|ctrl|dmso")][1]
+    replicate_condition_lookup$condition[str_detect(str_to_lower(replicate_condition_lookup$condition), "control|ctrl|dmso")][1]
 if (is.na(control_condition) || control_condition == "") {
-    control_condition <- all_cdna_conditions[1]
+    control_condition <- replicate_condition_lookup$condition[1]
 }
 
 control_replicates <-
-    cdna_sample[str_detect(cdna_sample, paste0("^", control_condition, "_[0-9]+$"))]
-if (length(control_replicates) == 0) {
-    control_replicates <- cdna_sample[str_detect(str_to_lower(cdna_sample), "control|ctrl|dmso")]
-}
+    replicate_condition_lookup$cDNA_sample[replicate_condition_lookup$condition == control_condition]
 if (length(control_replicates) == 0) {
     control_replicates <- cdna_sample[1]
 }
@@ -969,7 +1078,7 @@ build_barcode_control_comparison <- function(barcode_activity_df, control_replic
             by = c("barcode", "tf", "promoter")
         ) %>%
         mutate(
-            comparison = cDNA_sample,
+            comparison = condition,
             sample_log2_mean_RPM = log2_mean_RPM,
             deviation = sample_log2_mean_RPM - control_log2_mean_RPM,
             residual = sample_log2_mean_RPM - control_log2_mean_RPM
@@ -977,8 +1086,43 @@ build_barcode_control_comparison <- function(barcode_activity_df, control_replic
 }
 
 barcode_activity_df <- summarise_barcode_activity(activity_df)
+barcode_activity_df <- barcode_activity_df %>%
+    left_join(replicate_condition_lookup, by = "cDNA_sample")
 
 barcode_control_comparison_df <- build_barcode_control_comparison(barcode_activity_df, control_replicates)
+
+message("==== Correcting banana shape (loess sample-to-control normalization) per comparison")
+if (banana_correction) {
+        barcode_control_comparison_df <- barcode_control_comparison_df %>%
+                group_by(comparison) %>%
+                group_modify(~ correct_banana_to_control(.x, "sample_log2_mean_RPM", "control_log2_mean_RPM")) %>%
+                ungroup()
+} else {
+        message("---- Skipping banana-shape correction (banana_correction = FALSE)")
+        barcode_control_comparison_df <- barcode_control_comparison_df %>%
+                mutate(sample_log2_mean_RPM_corrected = sample_log2_mean_RPM)
+}
+barcode_control_comparison_df <- barcode_control_comparison_df %>%
+        mutate(
+                deviation_corrected = sample_log2_mean_RPM_corrected - control_log2_mean_RPM,
+                residual_corrected = sample_log2_mean_RPM_corrected - control_log2_mean_RPM
+        )
+
+# Fold the banana-corrected activity back into barcode_activity_df itself, replacing
+# log2_mean_RPM/mean_RPM for non-control samples with their corrected value. Control
+# samples are the correction's fixed anchor and keep their originally measured value.
+message("==== Writing banana-corrected values back into barcode_activity_df")
+banana_corrected_lookup <- barcode_control_comparison_df %>%
+    select(cDNA_sample, barcode, tf, promoter, log2_mean_RPM_corrected = sample_log2_mean_RPM_corrected) %>%
+    distinct()
+
+barcode_activity_df <- barcode_activity_df %>%
+    left_join(banana_corrected_lookup, by = c("cDNA_sample", "barcode", "tf", "promoter")) %>%
+    mutate(
+        log2_mean_RPM = coalesce(log2_mean_RPM_corrected, log2_mean_RPM),
+        mean_RPM = 2^log2_mean_RPM
+    ) %>%
+    select(-log2_mean_RPM_corrected)
 
 if (!is.null(opt$barcode_activity_output)) {
     write.table(
@@ -1153,22 +1297,50 @@ control_residual_correlation_stats <-
         facet_label = paste(correlation_label, positive_slope_label, p_label, corr_label, slope_label, sep = "\n")
     )
 
-write.table(
-    control_residual_correlation_stats %>% select(-facet_label),
-    file = file.path(opt$plots_basedir, "control_barcode_residual_correlation_stats.tsv"),
-    row.names = FALSE,
-    quote = FALSE,
-    sep = "\t"
-)
+message("==== Plotting banana-corrected barcode activities vs control")
+pdf(file.path(opt$plots_basedir, "control_barcode_correlations_banana_corrected.pdf"), width = 16, height = 16)
+for (page_idx in seq_along(barcode_control_pages)) {
+    page_comparisons <- barcode_control_pages[[page_idx]]
+    page_df <- barcode_control_comparison_df %>%
+        filter(comparison %in% page_comparisons) %>%
+        mutate(comparison = factor(comparison, levels = page_comparisons))
+    page_labels <- barcode_control_labels %>%
+        filter(comparison %in% page_comparisons) %>%
+        filter(control_log2_mean_RPM > -2 | sample_log2_mean_RPM > -2) %>%
+        mutate(comparison = factor(comparison, levels = page_comparisons))
 
-# Keep legacy output path for downstream compatibility.
-write.table(
-    control_residual_correlation_stats %>% select(-facet_label),
-    file = file.path(opt$plots_basedir, "control_barcode_residual_negative_correlation_stats.tsv"),
-    row.names = FALSE,
-    quote = FALSE,
-    sep = "\t"
-)
+    if (nrow(page_df) == 0) {
+        next
+    }
+
+    p <- ggplot(page_df, aes(x = control_log2_mean_RPM, y = sample_log2_mean_RPM_corrected)) +
+        geom_point(alpha = 0.25, size = 0.7) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+        geom_text_repel(
+            data = page_labels,
+            aes(y = sample_log2_mean_RPM_corrected, label = tf),
+            size = 4,
+            max.overlaps = Inf,
+            min.segment.length = 0,
+            box.padding = 0.05,
+            point.padding = 0.05,
+            segment.color = "grey50"
+        ) +
+        facet_wrap(~comparison, ncol = 5) +
+        coord_equal() +
+        theme_pubr(border = T) +
+        ggtitle(paste0("Banana-corrected barcode activities vs ", control_condition, " control (page ", page_idx, "/", length(barcode_control_pages), ")")) +
+        xlab(paste0(control_condition, " control barcode activity (log2 mean RPM)")) +
+        ylab("Sample barcode activity (log2 mean RPM), banana-corrected") +
+        theme(
+            text = element_text(size = 14),
+            strip.text = element_text(size = 8, face = "bold"),
+            axis.text = element_text(size = 7)
+        )
+    print(p)
+}
+invisible(dev.off())
+
 
 message("==== Plotting residuals vs control with correlation test")
 pdf(file.path(opt$plots_basedir, "control_barcode_residuals_with_correlation_test.pdf"), width = 16, height = 16)
@@ -1215,23 +1387,20 @@ for (page_idx in seq_along(barcode_control_pages)) {
 }
 invisible(dev.off())
 
-# Keep legacy plot filename for downstream compatibility.
-file.copy(
-    from = file.path(opt$plots_basedir, "control_barcode_residuals_with_correlation_test.pdf"),
-    to = file.path(opt$plots_basedir, "control_barcode_residuals_with_negative_correlation_test.pdf"),
-    overwrite = TRUE
-)
-
 ################################ PLOT REPLICATE CORRELATIONS #############################
+
+condition_cDNA <- activity_df %>%
+    distinct(cDNA_sample) %>%
+    left_join(replicate_condition_lookup, by = "cDNA_sample")
 
 message("==== Plotting replicate correlations")
 # # Plot replicate correlation of the activity
 pdf(file.path(opt$plots_basedir, "replicate_correlations.pdf"),
     width = 15, height = 15
 )
-for (this_condition in all_cdna_conditions) {
-    message("----- ploting, ", this_condition)
-    replicates_of_this_sample <- cdna_sample[str_detect(cdna_sample, paste0("^", this_condition, "_[0-9]+$"))]
+for (this_condition in replicate_condition_lookup$condition %>% unique()) {
+    message("----- plotting, ", this_condition)
+    replicates_of_this_sample <- condition_cDNA$cDNA_sample[condition_cDNA$condition == this_condition]
     message("    Replicates: ", paste(replicates_of_this_sample, collapse = ", "))
 
     # Choose the y-label based on the number of replicates
@@ -1278,7 +1447,7 @@ pdf(file.path(opt$plots_basedir, "barcode_correlations.pdf"), width = 17, height
 # Start the plot
 for (this_cdna_sample in cdna_sample) {
     #print(this_cdna_sample)
-    message("----- ploting, ", this_cdna_sample)
+    message("----- plotting, ", this_cdna_sample)
     activity_df %>%
         filter(cDNA_sample == this_cdna_sample) %>%
         # Remove the random barcodes
