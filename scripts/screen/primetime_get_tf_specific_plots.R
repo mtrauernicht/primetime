@@ -752,8 +752,12 @@ if (!is.null(cdna_df)) {
             "Unknown"
         }
 
-        merged$condition <- infer_condition_from_replicate(merged$replicate)
-        merged$condition_key <- toupper(merged$condition)
+        # barcode_activity.txt already carries the canonical sample name as "condition";
+        # only fall back to suffix-inference when that column is missing (e.g. older files).
+        if (!"condition" %in% colnames(merged) || all(is.na(merged$condition))) {
+            merged$condition <- infer_condition_from_replicate(merged$replicate)
+        }
+        merged$condition_key <- toupper(trimws(as.character(merged$condition)))
         replicate_by_tf <- split(as.data.frame(merged), merged$tf)
     } else {
 
