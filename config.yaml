@@ -20,6 +20,9 @@ SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER: False
 
 NORMALIZE_COUNTS: True
 
+# Set to False to skip the banana-shaped bias correction of contrast vs reference barcode counts
+BANANA_CORRECTION: True
+
 
 
 # ==============================================================================

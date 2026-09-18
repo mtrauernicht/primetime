@@ -7,10 +7,15 @@
 
 #===============================================================================
 # ============================= Input and Output ===============================
-## Which plates should be processed?
+## Which plates should be processed? Tab-separated file with, per plate: plate_id,
+## path to the plate's read1/2 fastq (or pDNA fastq), and (for every non-pDNA plate)
+## the path to that plate's own SAMPLES_FILE (well,sample[,replicate_id] CSV).
+## Each plate can have its own SAMPLES_FILE, so a sample/condition can be present on
+## one plate but absent on another; the 3rd (optional) column of SAMPLES_FILE is a
+## stable replicate/well ID (e.g. "2") that, combined with the plate ID, becomes the
+## final replicate ID (e.g. sample "DMSO" on plate "U2OS" -> "DMSO_U2OS_2").
+## Example PLATES_FILE row: U2OS<TAB>/path/to/U2OS_R2.fastq.gz<TAB>/path/to/U2OS_samples.csv
 PLATES_FILE: /DATA/pipelines/primetime/testing_E2904/mt20260112_plates_to_file.txt
-## Which samples (wells) should be processed?
-SAMPLES_FILE: /DATA/pipelines/primetime/testing_E2904/E2904_well_specification.csv
 DEMULTIPLEX_DIRECTORY: /shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files/demultiplex
 ## Which comparisons should be performed?
 COMPARISONS_FILE: /DATA/pipelines/primetime/testing_E2904/mt20260112_comparisons.txt
@@ -24,6 +29,9 @@ PVALUE_THRESHOLD: 0.01
 SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER: False
 
 NORMALIZE_COUNTS: True
+
+# Set to False to skip the banana-shaped bias correction of contrast vs reference barcode counts
+BANANA_CORRECTION: True
 
 # Set to False to skip demultiplexing and reuse existing demultiplexed FASTQ files
 # from DEMULTIPLEX_DIRECTORY.
