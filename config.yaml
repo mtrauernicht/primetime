@@ -22,6 +22,15 @@ NORMALIZE_COUNTS: True
 
 # Set to False to skip the banana-shaped bias correction of contrast vs reference barcode counts
 BANANA_CORRECTION: True
+# Number of control (DMSO) replicates with the lowest pDNA bleed-through used as banana-correction reference
+# (all other samples, including remaining DMSO ones, are corrected against their mean). Use 0 for all controls.
+BANANA_REFERENCE_N: 3
+
+# Set to True to correct TF cDNA counts for sequencing-depth-dependent activity
+DEPTH_NORMALIZATION: False
+
+# Set to True to correct stable barcode-specific activity offsets per TF/promoter reporter
+BARCODE_OFFSET_CORRECTION: False
 
 
 

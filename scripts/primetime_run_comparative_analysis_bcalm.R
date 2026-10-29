@@ -52,7 +52,8 @@ option_list <- list(
         make_option(c("--num_replicates_reference"), type = "integer", default = 1, help = "Number of replicates for the reference condition"),
         make_option(c("--single_model"), type = "logical", default = FALSE, help = "Whether to make a single model for all the TFs or not"),
         make_option(c("--normalize"), type = "logical", default = TRUE, help = "Whether to normalize activities by promoter-specific negative controls"),
-        make_option(c("--banana_correction"), type = "logical", default = TRUE, help = "Whether to apply the banana-shaped bias correction to contrast vs reference barcode counts")
+        make_option(c("--banana_correction"), type = "logical", default = TRUE, help = "Whether to apply the banana-shaped bias correction to contrast vs reference barcode counts"),
+        make_option(c("--banana_reference_file"), type = "character", default = NULL, help = "Optional TSV (column 'replicate') listing the low-bleedthrough control replicates used as the banana-correction anchor. If missing, the reference replicates are used")
 )
 
 opt_parser <- OptionParser(option_list = option_list)
@@ -122,7 +123,7 @@ correct_banana_counts_activity <- function(cdna_count_matrix, pdna_count_matrix,
                 return(cdna_count_matrix)
         }
 
-        cdna_rpm <- sweep(cdna_count_matrix, 2, colSums(cdna_count_matrix), FUN = function(x, s) x / s * 1e6)
+        cdna_rpm <- sweep(cdna_count_matrix, 2, colSums(cdna_count_matrix, na.rm = TRUE), FUN = function(x, s) x / s * 1e6)
         pdna_rpm <- sweep(pdna_count_matrix, 2, colSums(pdna_count_matrix), FUN = function(x, s) x / s * 1e6)
         log2_activity <- log2((cdna_rpm + pseudocount) / (pdna_rpm + pseudocount))
 
@@ -190,6 +191,18 @@ correct_banana_counts_activity <- function(cdna_count_matrix, pdna_count_matrix,
         corrected_matrix
 }
 
+# Corrects every group of replicates (e.g. non-anchor reference replicates and the
+# contrast replicates) separately against the mean of the anchor replicates.
+# Anchor replicates themselves are left untouched.
+correct_banana_against_anchor <- function(cdna_count_matrix, pdna_count_matrix, anchor_replicates, replicate_groups) {
+        for (group in replicate_groups) {
+                group <- setdiff(group, anchor_replicates)
+                if (length(group) == 0) next
+                cdna_count_matrix <- correct_banana_counts_activity(cdna_count_matrix, pdna_count_matrix, anchor_replicates, group)
+        }
+        cdna_count_matrix
+}
+
 # Diagnostic MA plot (activity level), before vs after correction.
 plot_banana_diagnostic_activity <- function(cdna_matrix_before, cdna_matrix_after, pdna_matrix, ref_replicates, contrast_replicates, title_suffix, pseudocount = 1) {
         col_info <- split_replicate_bc_colname(colnames(cdna_matrix_before))
@@ -200,7 +213,7 @@ plot_banana_diagnostic_activity <- function(cdna_matrix_before, cdna_matrix_afte
         pdna_rpm <- sweep(pdna_matrix, 2, colSums(pdna_matrix), FUN = function(x, s) x / s * 1e6)
 
         make_activity_MA_df <- function(cdna_matrix) {
-                cdna_rpm <- sweep(cdna_matrix, 2, colSums(cdna_matrix), FUN = function(x, s) x / s * 1e6)
+                cdna_rpm <- sweep(cdna_matrix, 2, colSums(cdna_matrix, na.rm = TRUE), FUN = function(x, s) x / s * 1e6)
                 log2_activity <- log2((cdna_rpm + pseudocount) / (pdna_rpm + pseudocount))
 
                 long_df <- as.data.frame(log2_activity) %>%
@@ -293,7 +306,7 @@ plot_banana_diagnostic_mpra_scale <- function(cdna_matrix_before, cdna_matrix_af
         dna_norm <- round(sweep(pdna_matrix, 2, colSums(pdna_matrix), FUN = "/") * 1e7)
 
         make_mpra_scale_df <- function(cdna_matrix) {
-                rna_norm <- round(sweep(cdna_matrix, 2, colSums(cdna_matrix), FUN = "/") * 1e7)
+                rna_norm <- round(sweep(cdna_matrix, 2, colSums(cdna_matrix, na.rm = TRUE), FUN = "/") * 1e7)
                 logr <- log2(rna_norm + 1) - log2(dna_norm + 1)
 
                 long_df <- as.data.frame(logr) %>%
@@ -447,25 +460,39 @@ logfc_threshold <- if (normalize_counts) 0.5 else 0
 ref_replicates = paste0(reference_condition, "_", 1:opt$num_replicates_reference)
 contrast_replicates = paste0(contrast_condition, "_", 1:opt$num_replicates_contrast)
 
-cdna <- read.table(opt$cdna, header = TRUE, sep = "\t", check.names = FALSE) %>%
+
+# Low-bleedthrough control replicates used as the banana-correction anchor. The anchors
+# are loaded as extra columns so they can serve as reference, then dropped before modelling.
+banana_anchor_replicates <- character(0)
+if (banana_correction && !is.null(opt$banana_reference_file) && file.exists(opt$banana_reference_file)) {
+        banana_anchor_replicates <- as.character(read.table(opt$banana_reference_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)$replicate)
+}
+extra_anchor_replicates <- character(0)
+extra_anchor_replicates <- setdiff(banana_anchor_replicates, c(ref_replicates, contrast_replicates))
+cdna_all <- read.table(opt$cdna, header = TRUE, sep = "\t", check.names = FALSE)
+extra_anchor_replicates <- intersect(extra_anchor_replicates, colnames(cdna_all))
+banana_anchor_replicates <- intersect(banana_anchor_replicates, c(ref_replicates, contrast_replicates, extra_anchor_replicates))
+cdna <- cdna_all %>%
         select(
                 tf,
                 negative_control,
                 promoter,
                 barcode,
-                all_of(c(ref_replicates, contrast_replicates))
+                all_of(c(ref_replicates, contrast_replicates, extra_anchor_replicates))
         )
 
 # Now, biuld the design df, with columns: sample (conditions and pDNA), replicate (names ), pDNA (whether is pDNA or not) and treatment (condition name; None for pDNA)
 design_df <- data.frame(
-        replicate = c(ref_replicates, contrast_replicates),
+        replicate = c(ref_replicates, contrast_replicates, extra_anchor_replicates),
         treatment = c(
                 rep(reference_condition, length(ref_replicates)),
-                rep(contrast_condition, length(contrast_replicates))
+                rep(contrast_condition, length(contrast_replicates)),
+                rep("banana_anchor_only", length(extra_anchor_replicates))
         ),
         sample = c(
                 rep(reference_condition, length(ref_replicates)),
-                rep(contrast_condition, length(contrast_replicates))
+                rep(contrast_condition, length(contrast_replicates)),
+                rep("banana_anchor_only", length(extra_anchor_replicates))
         )
 )
 
@@ -518,7 +545,8 @@ df <-
                 id.vars = c("tf", "barcode_id", "promoter", "barcode", "negative_control"),
                 variable.name = "replicate",
                 value.name = "count"
-        )
+        ) %>%
+        filter(!is.na(count), is.finite(count))
 
 parsed_cdna <-
         df %>%
@@ -571,13 +599,25 @@ for (col in colnames(tmp_parsed_pdna) %>% setdiff(c("tf", "promoter", "negative_
         # print(barcode)
         # print('===========')
         # See which column of parsed_cdna has the same barcode and return them
-        columns_w_same_bc <- columns_of_parsed_cdna[columns_of_parsed_cdna %>% grep(barcode, .)]
+        columns_w_same_bc <- columns_of_parsed_cdna[endsWith(columns_of_parsed_cdna, paste0("_", barcode))]
         # print(columns_w_same_bc)
         for (col_w_same_bc in columns_w_same_bc) {
                 parsed_pdna[[col_w_same_bc]] <- as.numeric(tmp_parsed_pdna[[col]])
         }
 }
 parsed_pdna <- do.call(cbind, parsed_pdna) %>% as.data.frame()
+
+cdna_row_keys <- paste(parsed_cdna$tf, parsed_cdna$negative_control, parsed_cdna$promoter, sep = "\r")
+pdna_row_keys <- paste(tmp_parsed_pdna$tf, tmp_parsed_pdna$negative_control, tmp_parsed_pdna$promoter, sep = "\r")
+if (anyDuplicated(cdna_row_keys) || anyDuplicated(pdna_row_keys)) {
+        stop("cDNA/pDNA TF-promoter row keys are not unique")
+}
+pdna_row_order <- match(cdna_row_keys, pdna_row_keys)
+if (anyNA(pdna_row_order)) {
+        stop("Some cDNA TF-promoter rows have no matching pDNA rows")
+}
+parsed_pdna <- parsed_pdna[pdna_row_order, , drop = FALSE]
+tmp_parsed_pdna <- tmp_parsed_pdna[pdna_row_order, , drop = FALSE]
 
 # ============ SINGLE MODEL - ALL PROMOTERS TOGETHER =====================================
 # ==========================================================================================
@@ -626,17 +666,34 @@ message("Rows: ", nrow(this_cdna_matrix), " | Unique row names: ", length(unique
 this_cdna_matrix_precorrection <- this_cdna_matrix
 if (banana_correction) {
         message("---- Correcting banana-shaped bias (activity level: log2(cDNA_RPM/pDNA_RPM)) in contrast vs reference barcode counts")
-        this_cdna_matrix <- correct_banana_counts_activity(this_cdna_matrix, this_pdna_matrix, ref_replicates, contrast_replicates)
+        if (length(banana_anchor_replicates) > 0) {
+                message("---- Banana anchor (low-bleedthrough controls): ", paste(banana_anchor_replicates, collapse = ", "))
+                diag_ref_replicates <- banana_anchor_replicates
+                this_cdna_matrix <- correct_banana_against_anchor(
+                        this_cdna_matrix, this_pdna_matrix, banana_anchor_replicates,
+                        list(ref_replicates, contrast_replicates)
+                )
+        } else {
+                diag_ref_replicates <- ref_replicates
+                this_cdna_matrix <- correct_banana_counts_activity(this_cdna_matrix, this_pdna_matrix, ref_replicates, contrast_replicates)
+        }
 
         pdf(file.path(opt$plot_output, "banana_diagnostics", output_pdf_name), width = 12, height = 6)
-        plot_banana_diagnostic_activity(this_cdna_matrix_precorrection, this_cdna_matrix, this_pdna_matrix, ref_replicates, contrast_replicates, "all promoters")
-        plot_banana_diagnostic_mpra_scale(this_cdna_matrix_precorrection, this_cdna_matrix, this_pdna_matrix, ref_replicates, contrast_replicates, "all promoters")
+        plot_banana_diagnostic_activity(this_cdna_matrix_precorrection, this_cdna_matrix, this_pdna_matrix, diag_ref_replicates, contrast_replicates, "all promoters")
+        plot_banana_diagnostic_mpra_scale(this_cdna_matrix_precorrection, this_cdna_matrix, this_pdna_matrix, diag_ref_replicates, contrast_replicates, "all promoters")
         invisible(dev.off())
 
         print("This cDNA matrix (after banana correction)")
         print(head(this_cdna_matrix))
 } else {
         message("---- Skipping banana-shaped bias correction (banana_correction = FALSE)")
+}
+
+if (length(extra_anchor_replicates) > 0) {
+        keep_cols <- !split_replicate_bc_colname(colnames(this_cdna_matrix))$replicate %in% extra_anchor_replicates
+        this_cdna_matrix <- this_cdna_matrix[, keep_cols, drop = FALSE]
+        this_pdna_matrix <- this_pdna_matrix[, keep_cols, drop = FALSE]
+        this_cdna_matrix_precorrection <- this_cdna_matrix_precorrection[, keep_cols, drop = FALSE]
 }
 
 # ========================================================================================

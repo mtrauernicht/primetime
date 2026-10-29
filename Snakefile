@@ -50,6 +50,9 @@ comparisons_file = config['COMPARISONS_FILE']
 samples_file = config['SAMPLES_FILE']
 normalize_counts = "TRUE" if config.get("NORMALIZE_COUNTS", True) else "FALSE"
 banana_correction = "TRUE" if config.get("BANANA_CORRECTION", True) else "FALSE"
+banana_reference_n = int(config.get("BANANA_REFERENCE_N", 3))
+depth_normalization = "TRUE" if config.get("DEPTH_NORMALIZATION", False) else "FALSE"
+barcode_offset_correction = "TRUE" if config.get("BARCODE_OFFSET_CORRECTION", False) else "FALSE"
 
 
 # Goodbye message
@@ -151,6 +154,9 @@ rule all:
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
         qc=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
+        depth_correlation=os.path.join(output_dir, "primetime_QC/cDNA_depth_correlations.pdf"),
+        barcode_offset_correlation=os.path.join(output_dir, "primetime_QC/barcode_offset_correction.pdf"),
+        bleedthrough_all=os.path.join(output_dir, "primetime_QC/bleedthrough_estimation_all_reporters.pdf"),
         heatmap_comparisons=os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
         umap_plot=os.path.join(output_dir, "primetime_results/umap_conditions.pdf"),
         all_comparisons=[
@@ -303,6 +309,8 @@ rule get_activity_and_qc_plots:
         ),
         read_counts=os.path.join(output_dir, "primetime_QC/read_counts.pdf"),
         bc_counts=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
+        depth_correlation=os.path.join(output_dir, "primetime_QC/cDNA_depth_correlations.pdf"),
+        barcode_offset_correlation=os.path.join(output_dir, "primetime_QC/barcode_offset_correction.pdf"),
         control_bc_corr=os.path.join(output_dir, "primetime_QC/control_barcode_correlations.pdf"),
         bleedthrough=os.path.join(
             output_dir, "primetime_QC/bleedthrough_estimation.pdf"
@@ -310,6 +318,12 @@ rule get_activity_and_qc_plots:
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
         barcode_activity=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
+        barcode_removal_report=os.path.join(output_dir, "tmp_primetime/activity/barcode_removal_report.tsv"),
+        depth_normalization_fits=os.path.join(output_dir, "tmp_primetime/activity/depth_normalization_fits.tsv"),
+        barcode_offset_correction_fits=os.path.join(output_dir, "tmp_primetime/activity/barcode_offset_correction_fits.tsv"),
+        bleedthrough_all=os.path.join(output_dir, "primetime_QC/bleedthrough_estimation_all_reporters.pdf"),
+        bleedthrough_all_data=os.path.join(output_dir, "tmp_primetime/activity/bleedthrough_all_reporters_per_condition.txt"),
+        banana_reference_samples=os.path.join(output_dir, "tmp_primetime/activity/banana_reference_samples.tsv"),
         read_count_summary=os.path.join(output_dir, "tmp_primetime/activity/read_count_per_sample.tsv"),
     params:
         script=os.path.join(scripts_dir, "primetime_get_activity_and_qc_plots.R"),
@@ -319,6 +333,9 @@ rule get_activity_and_qc_plots:
         activity_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
         barcode_activity_output=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
         banana_correction=banana_correction,
+        depth_normalization=depth_normalization,
+        barcode_offset_correction=barcode_offset_correction,
+        banana_reference_n=banana_reference_n,
     conda:
         os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
@@ -334,13 +351,17 @@ rule get_activity_and_qc_plots:
         --expected_pdna {params.expected_pdna_counts} \
         --cdna_output {output.cDNA} \
         --barcode_activity_output {params.barcode_activity_output} \
-        --banana_correction {params.banana_correction}
+        --banana_correction {params.banana_correction} \
+        --depth_normalization {params.depth_normalization} \
+        --barcode_offset_correction {params.barcode_offset_correction} \
+        --banana_reference_n {params.banana_reference_n}
         """
 
 rule run_comparative_analysis:
     input:
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
+        banana_reference=os.path.join(output_dir, "tmp_primetime/activity/banana_reference_samples.tsv"),
     output:
         txt=os.path.join(output_dir, "primetime_results/output_data/{contrast}_vs_{ref}.txt"),
         plots=os.path.join(output_dir, "primetime_results/volcano_plots/{contrast}_vs_{ref}.pdf"),
@@ -373,7 +394,8 @@ rule run_comparative_analysis:
         --num_replicates_reference {params.num_replicates_reference} \
         --plot_output {params.plot_output_dir} \
         --normalize {params.normalize} \
-        --banana_correction {params.banana_correction}
+        --banana_correction {params.banana_correction} \
+        --banana_reference_file {input.banana_reference}
         """
 
 ##########################################################################################

@@ -42,10 +42,18 @@ option_list <- list(
     make_option(c("--design"), type = "character", help = "Comma-separated list of design (SAMPLES_FILE) CSVs with sample/well names, one per plate, in plate order"),
     make_option(c("--expected_pdna"), type = "character", help = "Path to expected pDNA counts"),
     make_option(c("--cdna_output"), type = "character", help = "Path to save the cDNA counts for MPRAnalyze"),
+    make_option(c("--cdna_baseline_output"), type = "character", help = "Path to save uncorrected cDNA counts for order-independent banana correction"),
     make_option(c("--barcode_activity_output"), type = "character", help = "Path to save barcode-level activity used for barcode correlations"),
     make_option(c("--viability_file"), type = "character", default = "", help = "Optional comma-separated viability matrix files"),
     make_option(c("--comparisons"), type = "character", default = "", help = "Tab-delimited reference-to-contrast comparison file"),
-    make_option(c("--banana_correction"), type = "logical", default = TRUE, help = "Whether to apply the banana-shaped bias correction (loess sample-to-control normalization) to barcode activity")
+    make_option(c("--banana_reference_n"), type = "integer", default = 3, help = "Number of control (DMSO) replicates with the lowest pDNA bleed-through used as the banana-correction reference (<= 0 or more than available: use all control replicates)"),
+    make_option(c("--plate_ids"), type = "character", default = "", help = "Comma-separated sample plate IDs (PLATES_FILE) used to assign replicates to plates for --banana_per_plate"),
+    make_option(c("--banana_per_plate"), type = "logical", default = FALSE, help = "Whether to select banana anchors and fit the banana correction separately for each plate"),
+    make_option(c("--banana_on_corrected"), type = "logical", default = FALSE, help = "Whether to fit the banana correction on counts that already carry the depth, offset and shrinkage corrections (instead of the uncorrected baseline) so they do not correct the same bias twice"),
+    make_option(c("--banana_correction"), type = "logical", default = TRUE, help = "Whether to apply the banana-shaped bias correction (loess sample-to-control normalization) to barcode activity"),
+    make_option(c("--shrinkage"), type = "logical", default = FALSE, help = "Whether to shrink low-count TF cDNA measurements toward the control (DMSO) level (empirical Bayes, median excess variance)"),
+    make_option(c("--depth_normalization"), type = "logical", default = FALSE, help = "Whether to normalize cDNA counts for TF-specific sequencing-depth-dependent activity"),
+    make_option(c("--barcode_offset_correction"), type = "logical", default = FALSE, help = "Whether to correct stable barcode-specific activity offsets within each TF/promoter reporter")
 )
 
 # Functions for the plots
@@ -277,6 +285,327 @@ correct_banana_to_control <- function(df, sample_col, control_col, span = 0.75) 
     df %>% select(-A, -M, -M_fitted, -M_corrected)
 }
 
+# Empirical-Bayes shrinkage of low-count TF measurements around each sample's own trend.
+# For every TF and cDNA replicate, log2 RPM of the barcode-summed count is compared with the TF's
+# mean over control replicates. A robust loess of that difference against the control level gives
+# the replicate's systematic shift (e.g. a different floor for weakly active reporters); the
+# shrinkage target is control mean + trend, so only TF-specific noise is shrunk and the systematic
+# shift is left alone. Weight w = tv / (tv + nv), where nv = 1 / (ln(2)^2 * count) is the count-noise
+# variance on the log2 scale and tv is the median excess variance
+# ((log2 RPM - target)^2 - nv) over all TFs and replicates. Returns one multiplicative factor per
+# TF/replicate; low-count measurements are pulled in hardest.
+fit_shrinkage <- function(counts_df, enabled = FALSE, pseudocount = 0.5, min_tv = 1e-3, span = 0.75, min_tfs = 30) {
+    empty <- tibble(tf = character(), replicate = character(), n_reads = numeric(), shrink_weight = numeric(), shrink_factor = numeric())
+    if (!isTRUE(enabled)) {
+        return(empty)
+    }
+
+    tf_df <- counts_df %>%
+        filter(!pDNA) %>%
+        group_by(tf, replicate, sample) %>%
+        summarise(
+            n_reads = pmax(sum(raw_count, na.rm = TRUE) - n(), 0),
+            total_read_count = first(total_read_count),
+            .groups = "drop"
+        ) %>%
+        filter(is.finite(total_read_count), total_read_count > 0) %>%
+        mutate(
+            log2_rpm = log2((n_reads + pseudocount) / total_read_count * 1e6),
+            noise_var = 1 / (log(2)^2 * (n_reads + pseudocount))
+        )
+
+    samples <- unique(tf_df$sample)
+    control_sample <- samples[str_detect(str_to_lower(samples), "control|ctrl|dmso")][1]
+    if (is.na(control_sample)) {
+        control_sample <- samples[1]
+    }
+
+    control_mean <- tf_df %>%
+        filter(sample == control_sample) %>%
+        group_by(tf) %>%
+        summarise(control_log2_rpm = mean(log2_rpm), .groups = "drop")
+
+    tf_df <- tf_df %>%
+        inner_join(control_mean, by = "tf") %>%
+        group_by(replicate) %>%
+        mutate(
+            diff_to_control = log2_rpm - control_log2_rpm,
+            trend = {
+                fit <- if (n() >= min_tfs && n_distinct(control_log2_rpm) >= 5) {
+                    tryCatch(
+                        loess(diff_to_control ~ control_log2_rpm, span = span, degree = 1, family = "symmetric"),
+                        error = function(e) NULL
+                    )
+                } else {
+                    NULL
+                }
+                pred <- if (is.null(fit)) rep(0, n()) else suppressWarnings(predict(fit, newdata = data.frame(control_log2_rpm = control_log2_rpm)))
+                ifelse(is.finite(pred), pred, 0)
+            },
+            target_log2_rpm = control_log2_rpm + trend,
+            excess_var = (log2_rpm - target_log2_rpm)^2 - noise_var
+        ) %>%
+        ungroup()
+
+    true_var <- max(median(tf_df$excess_var, na.rm = TRUE), min_tv)
+    message("---- Shrinkage around the per-replicate trend relative to ", control_sample,
+            " (median excess variance ", signif(true_var, 3), ")")
+
+    tf_df %>%
+        mutate(
+            shrink_weight = true_var / (true_var + noise_var),
+            shrunk_log2_rpm = target_log2_rpm + shrink_weight * (log2_rpm - target_log2_rpm),
+            shrink_factor = 2^(shrunk_log2_rpm - log2_rpm)
+        ) %>%
+        select(tf, replicate, n_reads, shrink_weight, shrink_factor)
+}
+
+fit_depth_normalization <- function(counts_df, output_file, enabled = FALSE, span = 0.75) {
+    cDNA_df <- counts_df %>%
+        filter(!pDNA) %>%
+        group_by(tf, replicate) %>%
+        summarise(
+            total_read_count = first(total_read_count),
+            mean_RPM = mean(RPM, na.rm = TRUE),
+            .groups = "drop"
+        ) %>%
+        mutate(
+            log_depth = log2(total_read_count),
+            log2_mean_RPM = log2(mean_RPM + 1)
+        ) %>%
+        filter(is.finite(log_depth), is.finite(log2_mean_RPM), total_read_count > 0)
+
+    fit_df <- cDNA_df %>%
+        group_by(tf) %>%
+        group_modify(~ {
+            this_df <- .x
+            fit <- if (nrow(this_df) >= 5 && n_distinct(this_df$log_depth) >= 4) {
+                tryCatch(loess(log2_mean_RPM ~ log_depth, data = this_df, span = span), error = function(e) NULL)
+            } else {
+                NULL
+            }
+
+            target_depth <- median(this_df$log_depth, na.rm = TRUE)
+            this_df$predicted <- if (is.null(fit)) this_df$log2_mean_RPM else predict(fit, newdata = this_df)
+            target_prediction <- if (is.null(fit)) {
+                median(this_df$log2_mean_RPM, na.rm = TRUE)
+            } else {
+                predict(fit, newdata = data.frame(log_depth = target_depth))
+            }
+            this_df$target_prediction <- as.numeric(target_prediction)
+            this_df$depth_factor <- if (isTRUE(enabled)) 2^(this_df$target_prediction - this_df$predicted) else 1
+            this_df$fit_status <- if (is.null(fit)) "insufficient_data" else "loess"
+            this_df
+        }) %>%
+        ungroup() %>%
+        mutate(
+            predicted = ifelse(is.finite(predicted), predicted, log2_mean_RPM),
+            target_prediction = ifelse(is.finite(target_prediction), target_prediction, log2_mean_RPM),
+            depth_factor = ifelse(is.finite(depth_factor) & depth_factor > 0, depth_factor, 1)
+        )
+
+    if (is.null(output_file)) {
+        return(fit_df %>% select(tf, replicate, total_read_count, log_depth, mean_RPM, predicted, target_prediction, depth_factor, fit_status))
+    }
+
+    plot_df <- cDNA_df %>%
+        left_join(fit_df %>% select(tf, replicate, predicted, depth_factor, fit_status), by = c("tf", "replicate")) %>%
+        mutate(stage = "Before normalization") %>%
+        bind_rows(
+            cDNA_df %>%
+                left_join(fit_df %>% select(tf, replicate, predicted, depth_factor, fit_status), by = c("tf", "replicate")) %>%
+                mutate(
+                    stage = "After normalization",
+                    log2_mean_RPM = log2_mean_RPM + log2(depth_factor)
+                )
+        )
+
+    pdf(output_file, width = 16, height = 14)
+    if (nrow(plot_df) > 0) {
+        tf_pages <- split(
+            sort(unique(plot_df$tf)),
+            ceiling(seq_along(sort(unique(plot_df$tf))) / 6)
+        )
+
+        for (page_idx in seq_along(tf_pages)) {
+            page_tfs <- tf_pages[[page_idx]]
+            page_df <- plot_df %>%
+                filter(tf %in% page_tfs) %>%
+                mutate(tf = factor(tf, levels = page_tfs))
+            fit_line_df <- page_df %>%
+                filter(stage == "Before normalization", fit_status == "loess") %>%
+                arrange(tf, log_depth)
+
+            print(
+                ggplot(page_df, aes(x = log_depth, y = log2_mean_RPM)) +
+                    geom_point(aes(color = stage), alpha = 0.65, size = 2) +
+                    geom_line(
+                        data = fit_line_df,
+                        aes(x = log_depth, y = predicted, group = tf),
+                        inherit.aes = FALSE,
+                        color = "#2c7fb8",
+                        linewidth = 0.8
+                    ) +
+                    facet_wrap(~tf, scales = "free_y", ncol = 2) +
+                    scale_color_manual(values = c(
+                        "Before normalization" = "#7f7f7f",
+                        "After normalization" = "#e15759"
+                    )) +
+                    theme_pubr(border = TRUE) +
+                    labs(
+                        title = paste0("cDNA activity versus sequencing depth (page ", page_idx, "/", length(tf_pages), ")"),
+                        subtitle = paste(
+                            if (isTRUE(enabled)) "Loess-based TF-specific depth normalization enabled." else "Depth normalization disabled.",
+                            "Blue line: loess fit before normalization."
+                        ),
+                        x = "Sequencing depth (log2 total cDNA reads)",
+                        y = "Mean cDNA RPM per TF (log2 + 1)",
+                        color = NULL
+                    ) +
+                    theme(
+                        strip.text = element_text(size = 12, face = "bold"),
+                        axis.text = element_text(size = 10),
+                        axis.title = element_text(size = 12),
+                        legend.position = "bottom"
+                    )
+            )
+        }
+    } else {
+        plot.new()
+        text(0.5, 0.5, "No cDNA observations available for depth normalization")
+    }
+    invisible(dev.off())
+
+    fit_df %>% select(tf, replicate, total_read_count, log_depth, mean_RPM, predicted, target_prediction, depth_factor, fit_status)
+}
+
+fit_barcode_offsets <- function(counts_df, output_file, enabled = FALSE) {
+    pdna_rpm <- counts_df %>%
+        filter(pDNA) %>%
+        group_by(barcode) %>%
+        summarise(pDNA_RPM = mean(RPM, na.rm = TRUE), .groups = "drop")
+
+    activity_df <- counts_df %>%
+        filter(!pDNA) %>%
+        left_join(pdna_rpm, by = "barcode") %>%
+        mutate(
+            log2_activity = log2((RPM + 1) / (pDNA_RPM + 1))
+        ) %>%
+        filter(is.finite(log2_activity), is.finite(pDNA_RPM), pDNA_RPM >= 0)
+
+    offset_df <- activity_df %>%
+        group_by(tf, promoter, replicate) %>%
+        mutate(sample_median = median(log2_activity, na.rm = TRUE), residual = log2_activity - sample_median) %>%
+        ungroup() %>%
+        group_by(tf, promoter, barcode) %>%
+        summarise(
+            offset = median(residual, na.rm = TRUE),
+            n_replicates = n_distinct(replicate),
+            .groups = "drop"
+        ) %>%
+        group_by(tf, promoter) %>%
+        mutate(
+            offset = offset - median(offset, na.rm = TRUE),
+            correction_factor = if (isTRUE(enabled)) 2^(-offset) else 1
+        ) %>%
+        ungroup() %>%
+        mutate(
+            offset = ifelse(is.finite(offset), offset, 0),
+            correction_factor = ifelse(is.finite(correction_factor) & correction_factor > 0, correction_factor, 1)
+        )
+
+    if (is.null(output_file)) {
+        return(offset_df)
+    }
+
+    plot_df <- activity_df %>%
+        left_join(offset_df %>% select(tf, promoter, barcode, offset, correction_factor), by = c("tf", "promoter", "barcode")) %>%
+        mutate(
+            stage = "Before correction",
+            corrected_log2_activity = log2_activity + log2(correction_factor)
+        ) %>%
+        bind_rows(
+            activity_df %>%
+                left_join(offset_df %>% select(tf, promoter, barcode, offset, correction_factor), by = c("tf", "promoter", "barcode")) %>%
+                mutate(
+                    stage = "After correction",
+                    log2_activity = log2_activity + log2(correction_factor),
+                    corrected_log2_activity = log2_activity
+                )
+        ) %>%
+        group_by(tf, promoter, replicate, stage) %>%
+        mutate(relative_log2_activity = log2_activity - median(log2_activity, na.rm = TRUE)) %>%
+        ungroup() %>%
+        mutate(reporter = paste(tf, promoter, sep = "\n"))
+
+    pdf(output_file, width = 16, height = 14)
+    if (nrow(plot_df) > 0) {
+        reporter_pages <- split(
+            sort(unique(plot_df$reporter)),
+            ceiling(seq_along(sort(unique(plot_df$reporter))) / 6)
+        )
+
+        for (page_idx in seq_along(reporter_pages)) {
+            page_reporters <- reporter_pages[[page_idx]]
+            page_df <- plot_df %>%
+                filter(reporter %in% page_reporters) %>%
+                mutate(reporter = factor(reporter, levels = page_reporters))
+
+            print(
+                ggplot(page_df, aes(x = barcode, y = relative_log2_activity)) +
+                    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+                    geom_boxplot(
+                        aes(fill = stage),
+                        position = position_dodge(width = 0.75),
+                        alpha = 0.2,
+                        outlier.shape = NA,
+                        width = 0.65
+                    ) +
+                    geom_point(
+                        aes(color = stage),
+                        position = position_jitterdodge(jitter.width = 0.14, dodge.width = 0.75),
+                        alpha = 0.5,
+                        size = 1.2
+                    ) +
+                    facet_wrap(~reporter, scales = "free_y", ncol = 2) +
+                    scale_color_manual(values = c(
+                        "Before correction" = "#7f7f7f",
+                        "After correction" = "#e15759"
+                    )) +
+                    scale_fill_manual(values = c(
+                        "Before correction" = "#7f7f7f",
+                        "After correction" = "#e15759"
+                    )) +
+                    theme_pubr(border = TRUE) +
+                    labs(
+                        title = paste0("Barcode-offset correction diagnostic (page ", page_idx, "/", length(reporter_pages), ")"),
+                        subtitle = paste(
+                            if (isTRUE(enabled)) "Stable barcode offsets corrected within each TF/promoter reporter." else "Barcode-offset correction disabled.",
+                            "Values are centered within each sample, so tighter distributions indicate reduced barcode spread."
+                        ),
+                        x = "Barcode",
+                        y = "Barcode activity relative to sample median (log2)",
+                        color = NULL,
+                        fill = NULL
+                    ) +
+                    theme(
+                        strip.text = element_text(size = 11, face = "bold"),
+                        axis.text.x = element_text(angle = 90, hjust = 1, size = 9),
+                        axis.text.y = element_text(size = 10),
+                        axis.title = element_text(size = 12),
+                        legend.position = "bottom"
+                    )
+            )
+        }
+    } else {
+        plot.new()
+        text(0.5, 0.5, "No finite cDNA/pDNA barcode activities available for offset correction")
+    }
+    invisible(dev.off())
+
+    offset_df
+}
+
 ##########################################################################################
 ## Start of the script ###################################################################
 ##########################################################################################
@@ -284,6 +613,11 @@ correct_banana_to_control <- function(df, sample_col, control_col, span = 0.75) 
 opt_parser <- OptionParser(option_list = option_list)
 opt <- parse_args(opt_parser)
 banana_correction <- isTRUE(opt$banana_correction)
+banana_per_plate <- isTRUE(opt$banana_per_plate)
+banana_on_corrected <- isTRUE(opt$banana_on_corrected)
+depth_normalization <- isTRUE(opt$depth_normalization)
+shrinkage <- isTRUE(opt$shrinkage)
+barcode_offset_correction <- isTRUE(opt$barcode_offset_correction)
 
 if (!is.null(opt$plots_basedir) && nzchar(opt$plots_basedir)) {
     dir.create(opt$plots_basedir, recursive = TRUE, showWarnings = FALSE)
@@ -374,6 +708,168 @@ for(entry in unique_files){
 
 }
 
+pdna_rpm_by_barcode <- counts_df %>%
+    filter(pDNA) %>%
+    group_by(barcode) %>%
+    summarise(pDNA_rpm = mean(RPM), .groups = "drop")
+
+# Remove low-deviation barcode activities independently for each replicate.
+barcode_noise_metrics <- counts_df %>%
+    filter(!pDNA) %>%
+    left_join(pdna_rpm_by_barcode, by = "barcode") %>%
+    group_by(tf, replicate) %>%
+    mutate(
+        activity = RPM / pDNA_rpm,
+        median_activity = median(activity),
+        dev_activity = activity / median_activity
+    ) %>%
+    ungroup() %>%
+    mutate(noisy_in_replicate = dev_activity <= 0.2)
+
+removed_barcodes <- barcode_noise_metrics %>%
+    filter(noisy_in_replicate) %>%
+    distinct(barcode, tf, replicate)
+
+# A barcode noisy in more than 10% of cDNA replicates is dropped from every cDNA replicate.
+n_cdna_replicates <- counts_df %>% filter(!pDNA) %>% distinct(replicate) %>% nrow()
+global_barcode_summary <- removed_barcodes %>%
+    count(barcode, tf, name = "n_removed") %>%
+    mutate(
+        n_cdna_replicates = n_cdna_replicates,
+        removed_fraction = n_removed / n_cdna_replicates,
+        globally_noisy = removed_fraction > 0.1
+    )
+globally_noisy_barcodes <- global_barcode_summary %>%
+    filter(globally_noisy) %>%
+    select(barcode, tf)
+
+barcode_removal_report <- barcode_noise_metrics %>%
+    left_join(global_barcode_summary, by = c("barcode", "tf")) %>%
+    mutate(
+        n_removed = coalesce(n_removed, 0L),
+        n_cdna_replicates = coalesce(n_cdna_replicates, .env$n_cdna_replicates),
+        removed_fraction = coalesce(removed_fraction, 0),
+        globally_noisy = coalesce(globally_noisy, FALSE),
+        removal_reason = case_when(
+            globally_noisy & noisy_in_replicate ~ "local_noise_rule; global_threshold",
+            globally_noisy ~ "global_threshold",
+            noisy_in_replicate ~ "local_noise_rule",
+            TRUE ~ NA_character_
+        )
+    ) %>%
+    filter(!is.na(removal_reason)) %>%
+    select(
+        sample, replicate, tf, barcode, raw_count, RPM, pDNA_rpm, activity,
+        median_activity, dev_activity, noisy_in_replicate, n_removed,
+        n_cdna_replicates, removed_fraction, removal_reason
+    )
+
+write.table(
+    barcode_removal_report,
+    file = file.path(opt$activity_basedir, "barcode_removal_report.tsv"),
+    row.names = FALSE,
+    quote = FALSE,
+    sep = "\t"
+)
+
+message("==== Removing ", nrow(removed_barcodes), " noisy cDNA barcode measurements")
+message("==== Removing ", nrow(globally_noisy_barcodes), " barcodes noisy in >10% of cDNA replicates from all cDNA replicates")
+counts_df <- counts_df %>%
+    anti_join(removed_barcodes, by = c("barcode", "tf", "replicate")) %>%
+    anti_join(globally_noisy_barcodes %>% mutate(pDNA = FALSE), by = c("barcode", "tf", "pDNA"))
+
+normalization_baseline_counts <- counts_df
+
+banana_reference_n <- if (is.null(opt$banana_reference_n) || is.na(opt$banana_reference_n)) 3 else opt$banana_reference_n
+select_banana_anchors <- function(bleedthrough_df) {
+    if (banana_reference_n > 0 && nrow(bleedthrough_df) > banana_reference_n) {
+        bleedthrough_df$sample[seq_len(banana_reference_n)]
+    } else {
+        bleedthrough_df$sample
+    }
+}
+# Replicates are named <sample>_<plate_id>_<id>, so the plate is the longest listed plate ID
+# embedded in the name; "all" when per-plate correction is off or no plate ID matches.
+banana_plate_ids <- trimws(strsplit(if (is.null(opt$plate_ids)) "" else opt$plate_ids, ",")[[1]])
+banana_plate_ids <- banana_plate_ids[banana_plate_ids != ""]
+banana_plate_ids <- banana_plate_ids[order(-nchar(banana_plate_ids))]
+plate_key <- function(x) {
+    if (!banana_per_plate || length(banana_plate_ids) == 0) {
+        return(rep("all", length(x)))
+    }
+    vapply(x, function(name) {
+        hit <- banana_plate_ids[vapply(banana_plate_ids, function(p) grepl(paste0("_", p, "_[^_]*$"), name, fixed = FALSE), logical(1))]
+        if (length(hit) == 0) "all" else hit[1]
+    }, character(1), USE.NAMES = FALSE)
+}
+
+message("==== Fitting TF-specific cDNA activity versus sequencing depth")
+depth_fit_df <- fit_depth_normalization(
+    normalization_baseline_counts,
+    file.path(opt$plots_basedir, "cDNA_depth_correlations.pdf"),
+    enabled = depth_normalization
+)
+write.table(
+    depth_fit_df,
+    file = file.path(opt$activity_basedir, "depth_normalization_fits.tsv"),
+    row.names = FALSE,
+    quote = FALSE,
+    sep = "\t"
+)
+
+if (!depth_normalization) {
+    message("---- Skipping sequencing-depth normalization (depth_normalization = FALSE)")
+}
+
+message("==== Estimating barcode-specific activity offsets")
+barcode_offset_df <- fit_barcode_offsets(
+    normalization_baseline_counts,
+    file.path(opt$plots_basedir, "barcode_offset_correction.pdf"),
+    enabled = barcode_offset_correction
+)
+write.table(
+    barcode_offset_df,
+    file = file.path(opt$activity_basedir, "barcode_offset_correction_fits.tsv"),
+    row.names = FALSE,
+    quote = FALSE,
+    sep = "\t"
+)
+
+if (!barcode_offset_correction) {
+    message("---- Skipping barcode-offset correction (barcode_offset_correction = FALSE)")
+}
+
+message("==== Estimating empirical-Bayes shrinkage of low-count TF measurements")
+shrinkage_fit_df <- fit_shrinkage(normalization_baseline_counts, enabled = shrinkage)
+write.table(
+    shrinkage_fit_df,
+    file = file.path(opt$activity_basedir, "shrinkage_fits.tsv"),
+    row.names = FALSE,
+    quote = FALSE,
+    sep = "\t"
+)
+
+message("==== Applying enabled corrections from the shared uncorrected baseline")
+counts_df <- normalization_baseline_counts %>%
+    left_join(
+        depth_fit_df %>% select(tf, replicate, depth_factor),
+        by = c("tf", "replicate")
+    ) %>%
+    left_join(shrinkage_fit_df %>% select(tf, replicate, shrink_factor), by = c("tf", "replicate")) %>%
+    left_join(
+        barcode_offset_df %>% select(tf, promoter, barcode, correction_factor),
+        by = c("tf", "promoter", "barcode")
+    ) %>%
+    mutate(
+        depth_factor = ifelse(!pDNA & is.finite(depth_factor), depth_factor, 1),
+        correction_factor = ifelse(!pDNA & is.finite(correction_factor) & correction_factor > 0, correction_factor, 1),
+        shrink_factor = ifelse(!pDNA & is.finite(shrink_factor) & shrink_factor > 0, shrink_factor, 1),
+        raw_count = raw_count * depth_factor * correction_factor * shrink_factor,
+        log2_count = log2(raw_count),
+        RPM = raw_count / total_read_count * 1e6
+    ) %>%
+    select(-depth_factor, -correction_factor, -shrink_factor)
+
 # ==============================================================================
 
 # Get number of obvservations: barcodes x TF x promoters
@@ -414,9 +910,16 @@ cDNA <- counts_df %>%
         names_from = replicate,
         values_from = RPM,
         id_cols = c('barcode', 'tf', 'negative_control', 'promoter')
-    ) %>%
-    # Assign 1 to NAs
-    mutate_all(~ ifelse(is.na(.), 1, .))
+    )
+
+cDNA_baseline <- normalization_baseline_counts %>%
+    filter(pDNA == F) %>%
+    select(-sample, -pDNA, -log2_count, -total_read_count, -raw_count) %>%
+    pivot_wider(
+        names_from = replicate,
+        values_from = RPM,
+        id_cols = c('barcode', 'tf', 'negative_control', 'promoter')
+    )
 
 # Save the cDNA df for MPRAnalyze (raw_counts)
 # message ('============= savign CDNA ==============')
@@ -425,12 +928,20 @@ counts_df %>%
     filter(pDNA == F) %>%
     select(-sample, -pDNA, -total_read_count, -log2_count, -RPM) %>%
     pivot_wider(names_from = replicate, values_from = raw_count) %>%
-    # Assign 1 to NAs
-    mutate_all(~ ifelse(is.na(.), 1, .)) %>%
     write.table(
         file = opt$cdna_output,
         row.names = FALSE, quote = F, sep = "\t"
     )
+if (!is.null(opt$cdna_baseline_output) && nzchar(opt$cdna_baseline_output)) {
+    normalization_baseline_counts %>%
+        filter(pDNA == F) %>%
+        select(-sample, -pDNA, -total_read_count, -log2_count, -RPM) %>%
+        pivot_wider(names_from = replicate, values_from = raw_count) %>%
+        write.table(
+            file = opt$cdna_baseline_output,
+            row.names = FALSE, quote = F, sep = "\t"
+        )
+}
 # Save the pDNA df for MPRAnalyze (raw_counts)
 # message ('============= savign PDNA ==============')
 counts_df %>%
@@ -452,6 +963,7 @@ merged <-
         by = "barcode"
     )
 
+merged_baseline <- merge(pDNA, cDNA_baseline, by = "barcode")
 
 pdna_sample <- colnames(pDNA) %>%
     unique() %>%
@@ -486,7 +998,7 @@ for (this_cdna_sample in cdna_sample) {
     for (this_pdna_sample in pdna_sample) {
         # message ("    Processing ", this_pdna_sample)
         # Get the equation of the line
-        this_df <- merged %>% filter(negative_control)
+        this_df <- merged_baseline %>% filter(negative_control)
         x <- this_df[[this_pdna_sample]]
         y <- this_df[[this_cdna_sample]]
         # Calculate the slope and intercept: y = slope * x + intercept
@@ -509,7 +1021,7 @@ for (this_cdna_sample in cdna_sample) {
 # Merge the cDNA and pDNA dfs with the equation df. For this, needs to melt the cDNA df first
 
 bleed_through_slope_df <-
-    cDNA %>%
+    cDNA_baseline %>%
     # filter(negative_control) %>%
     pivot_longer(
         cols = -c(barcode, tf, negative_control, promoter),
@@ -966,16 +1478,17 @@ for (smp in order_of_samples) {
         facet_wrap(~sample) +
         theme_pubr(border = T) +
         # Add the slope value, very big, above the plot
-        geom_label_repel(
+        # Fixed-position label: geom_label_repel silently drops labels it cannot place.
+        geom_label(
             data = df_lbl,
             aes(label = paste0("bleedt. = ", slope, "%")),
-            x = x_median,
+            x = Inf,
+            y = -Inf,
+            hjust = 1.05,
+            vjust = -0.3,
             color = "black",
-            segment.color = "white",
-            y = y_max,
-            hjust = 0,
-            vjust = 1,
-            size = 5
+            size = 5,
+            inherit.aes = FALSE
         ) +
         scale_color_manual(values = c(
             "positive" = corColors[5], # "#26a74a",
@@ -1003,37 +1516,122 @@ for (smp in order_of_samples) {
 
 invisible(dev.off())
 
+# Bleed-through QC using every reporter (not only the negative controls) -------------
+message("==== Plotting bleed-through estimation for all reporters")
+all_reporter_pdna_col <- pdna_sample[1]
+all_reporter_long <- merged %>%
+    select(barcode, tf, negative_control, all_of(c(all_reporter_pdna_col, cdna_sample))) %>%
+    pivot_longer(all_of(cdna_sample), names_to = "sample", values_to = "cDNA_RPM") %>%
+    rename(pDNA_RPM = all_of(all_reporter_pdna_col))
+
+all_reporter_fits <- all_reporter_long %>%
+    group_by(sample) %>%
+    group_modify(~ {
+        fit <- lm(cDNA_RPM ~ pDNA_RPM, data = .x)
+        data.frame(
+            slope = unname(coef(fit)[2]),
+            intercept = unname(coef(fit)[1]),
+            r2 = summary(fit)$r.squared
+        )
+    }) %>%
+    ungroup()
+
+write.table(
+    all_reporter_fits,
+    file = file.path(opt$activity_basedir, "bleedthrough_all_reporters_per_condition.txt"),
+    sep = "\t", quote = FALSE, row.names = FALSE
+)
+
+all_reporter_samples <- all_reporter_fits %>% arrange(desc(slope)) %>% pull(sample)
+all_reporter_pages <- split(all_reporter_samples, ceiling(seq_along(all_reporter_samples) / 12))
+pdf(file.path(opt$plots_basedir, "bleedthrough_estimation_all_reporters.pdf"), width = 16, height = 12)
+for (page_idx in seq_along(all_reporter_pages)) {
+    page_samples <- all_reporter_pages[[page_idx]]
+    page_df <- all_reporter_long %>%
+        filter(sample %in% page_samples) %>%
+        mutate(
+            sample = factor(sample, levels = page_samples),
+            pDNA_log2 = log2(pDNA_RPM + 1),
+            cDNA_log2 = log2(cDNA_RPM + 1)
+        )
+    page_fits <- all_reporter_fits %>%
+        filter(sample %in% page_samples) %>%
+        mutate(
+            sample = factor(sample, levels = page_samples),
+            label = paste0("bleedt. = ", round(slope * 100, 2), "%\nR2 = ", round(r2, 2))
+        )
+    page_fit_lines <- bind_rows(lapply(page_samples, function(smp) {
+        fit <- all_reporter_fits %>% filter(sample == smp)
+        sample_pdna <- all_reporter_long %>%
+            filter(sample == smp) %>%
+            pull(pDNA_RPM)
+        sample_pdna <- sample_pdna[is.finite(sample_pdna)]
+        if (length(sample_pdna) == 0 || !is.finite(fit$slope[1]) || !is.finite(fit$intercept[1])) {
+            return(data.frame(sample = character(0), pDNA_log2 = numeric(0), cDNA_log2 = numeric(0)))
+        }
+        x_values <- seq(min(sample_pdna, na.rm = TRUE), max(sample_pdna, na.rm = TRUE), length.out = 100)
+        predicted <- fit$intercept[1] + fit$slope[1] * x_values
+        data.frame(
+            sample = smp,
+            pDNA_log2 = log2(x_values + 1),
+            cDNA_log2 = ifelse(predicted >= 0, log2(predicted + 1), NA_real_)
+        ) %>%
+            filter(is.finite(pDNA_log2), is.finite(cDNA_log2))
+    })) %>%
+        mutate(sample = factor(sample, levels = page_samples))
+    print(
+        ggplot(page_df, aes(x = pDNA_log2, y = cDNA_log2)) +
+            geom_point(aes(color = negative_control), alpha = 0.3, size = 0.8) +
+            geom_line(data = page_fit_lines, aes(group = sample), color = "#dc3644", linewidth = 1) +
+            geom_text(
+                data = page_fits, aes(label = label), x = -Inf, y = Inf,
+                hjust = -0.05, vjust = 1.2, size = 3.5, inherit.aes = FALSE
+            ) +
+            facet_wrap(~sample, scales = "free_y", ncol = 4) +
+            scale_color_manual(values = c("TRUE" = "#dc3644", "FALSE" = "grey40"), name = "Negative control") +
+            theme_pubr(border = TRUE) +
+            labs(
+                title = paste0("pDNA bleed-through, all reporters (page ", page_idx, "/", length(all_reporter_pages), ")"),
+                x = "log2(pDNA RPM + 1)", y = "log2(cDNA RPM + 1)"
+            ) +
+            theme(strip.text = element_text(face = "bold", size = 9), legend.position = "bottom")
+    )
+}
+invisible(dev.off())
+
 
 
 # ==============================================================================
 # Get the activity of the TFs by deviding the values of the cDNA by the values of the pDNA
 # message("==== Calculating corrected activity")
-activity_df <- data.frame()
-# corrected_activity_df <- data.frame() # corrected for bleed-through
-for (this_cdna_sample in cdna_sample) {
-    # Get the values
-    cDNA_values <- merged[[this_cdna_sample]]
-    for (this_pdna_sample in pdna_sample) {
-        # message ("Processing ", this_cdna_sample, " and ", this_pdna_sample)
-        pDNA_values <- merged[[this_pdna_sample]]
-        # Calculate the activity
-        activity <- cDNA_values / pDNA_values
+make_activity_df <- function(merged_df) {
+    result <- data.frame()
+    for (this_cdna_sample in cdna_sample) {
+        cDNA_values <- merged_df[[this_cdna_sample]]
+        for (this_pdna_sample in pdna_sample) {
+            pDNA_values <- merged_df[[this_pdna_sample]]
+            activity <- cDNA_values / pDNA_values
+            keep_cDNA <- !is.na(cDNA_values)
 
-        # Add to the activity df -----------------------------------------------
-        activity_df <- rbind(
-            activity_df,
-            data.frame(
-                barcode = merged$barcode,
-                tf = merged$tf,
-                negative_control = merged$negative_control,
-                promoter = merged$promoter,
-                cDNA_sample = this_cdna_sample,
-                pDNA_sample = this_pdna_sample,
-                activity_RPM = activity
+            result <- rbind(
+                result,
+                data.frame(
+                    barcode = merged_df$barcode[keep_cDNA],
+                    tf = merged_df$tf[keep_cDNA],
+                    negative_control = merged_df$negative_control[keep_cDNA],
+                    promoter = merged_df$promoter[keep_cDNA],
+                    cDNA_sample = rep(this_cdna_sample, sum(keep_cDNA)),
+                    pDNA_sample = rep(this_pdna_sample, sum(keep_cDNA)),
+                    activity_RPM = activity[keep_cDNA]
+                )
             )
-        )
+        }
     }
+    result
 }
+
+activity_df <- make_activity_df(merged)
+baseline_activity_df <- make_activity_df(merged_baseline)
 
 summarise_barcode_activity <- function(df) {
     df %>%
@@ -1063,6 +1661,39 @@ if (length(control_replicates) == 0) {
     control_replicates <- cdna_sample[1]
 }
 
+# Use only the control replicates with the lowest pDNA bleed-through as the banana anchor,
+# so every sample (including the remaining controls) is corrected against bias-free controls.
+control_bleedthrough <- bleed_through_slope_df %>%
+    filter(sample %in% control_replicates) %>%
+    distinct(sample, slope) %>%
+    arrange(slope)
+global_banana_anchors <- select_banana_anchors(control_bleedthrough)
+
+control_bleedthrough$plate <- plate_key(control_bleedthrough$sample)
+banana_anchors_by_plate <- lapply(
+    split(control_bleedthrough, control_bleedthrough$plate),
+    select_banana_anchors
+)
+banana_reference_replicates <- unique(unlist(banana_anchors_by_plate))
+if (length(banana_reference_replicates) == 0) {
+    banana_reference_replicates <- global_banana_anchors
+}
+anchors_for_plate <- function(key) {
+    anchors <- banana_anchors_by_plate[[key]]
+    if (is.null(anchors) || length(anchors) == 0) global_banana_anchors else anchors
+}
+for (key in names(banana_anchors_by_plate)) {
+    message("==== Banana reference (", control_condition, " replicates with lowest bleed-through, plate ", key, "): ",
+            paste(banana_anchors_by_plate[[key]], collapse = ", "))
+}
+write.table(
+    control_bleedthrough %>%
+        transmute(replicate = sample, plate, bleedthrough_slope = slope, used_as_reference = sample %in% banana_reference_replicates),
+    file = file.path(opt$activity_basedir, "banana_reference_samples.tsv"),
+    sep = "\t", quote = FALSE, row.names = FALSE
+)
+control_label <- paste0(control_condition, " low-bleedthrough reference (n=", length(banana_reference_replicates), ")")
+
 build_barcode_control_comparison <- function(barcode_activity_df, control_replicates) {
     barcode_activity_df %>%
         filter(!cDNA_sample %in% control_replicates) %>%
@@ -1089,19 +1720,60 @@ barcode_activity_df <- summarise_barcode_activity(activity_df)
 barcode_activity_df <- barcode_activity_df %>%
     left_join(replicate_condition_lookup, by = "cDNA_sample")
 
-barcode_control_comparison_df <- build_barcode_control_comparison(barcode_activity_df, control_replicates)
+baseline_barcode_activity_df <- summarise_barcode_activity(baseline_activity_df) %>%
+    left_join(replicate_condition_lookup, by = "cDNA_sample")
+
+build_plate_control_comparison <- function(barcode_activity_df) {
+    keys <- plate_key(barcode_activity_df$cDNA_sample)
+    bind_rows(lapply(unique(keys), function(key) {
+        build_barcode_control_comparison(barcode_activity_df[keys == key, ], anchors_for_plate(key)) %>%
+            mutate(plate = key)
+    }))
+}
+barcode_control_comparison_df <- build_plate_control_comparison(barcode_activity_df)
+baseline_barcode_control_comparison_df <- build_plate_control_comparison(baseline_barcode_activity_df)
 
 message("==== Correcting banana shape (loess sample-to-control normalization) per comparison")
 if (banana_correction) {
-        barcode_control_comparison_df <- barcode_control_comparison_df %>%
-                group_by(comparison) %>%
+        # Fit the banana on counts that already carry the depth, offset and shrinkage corrections,
+        # so the banana only removes the bias those corrections have not explained.
+        if (banana_on_corrected) {
+                baseline_barcode_control_comparison_df <- barcode_control_comparison_df
+        }
+        baseline_barcode_control_comparison_df <- baseline_barcode_control_comparison_df %>%
+                group_by(comparison, plate) %>%
                 group_modify(~ correct_banana_to_control(.x, "sample_log2_mean_RPM", "control_log2_mean_RPM")) %>%
                 ungroup()
 } else {
         message("---- Skipping banana-shape correction (banana_correction = FALSE)")
-        barcode_control_comparison_df <- barcode_control_comparison_df %>%
+        baseline_barcode_control_comparison_df <- baseline_barcode_control_comparison_df %>%
                 mutate(sample_log2_mean_RPM_corrected = sample_log2_mean_RPM)
 }
+
+banana_correction_lookup <- baseline_barcode_control_comparison_df %>%
+    transmute(
+        cDNA_sample,
+        barcode,
+        tf,
+        promoter,
+        correction_delta = sample_log2_mean_RPM_corrected - sample_log2_mean_RPM
+    ) %>%
+    distinct()
+if (anyDuplicated(banana_correction_lookup[c("cDNA_sample", "barcode", "tf", "promoter")])) {
+    stop("Baseline banana-correction factors are not unique per sample/barcode/TF/promoter")
+}
+barcode_control_comparison_df <- barcode_control_comparison_df %>%
+    left_join(
+        banana_correction_lookup,
+        by = c("cDNA_sample", "barcode", "tf", "promoter")
+    )
+if (anyNA(barcode_control_comparison_df$correction_delta)) {
+    stop("Could not match baseline banana-correction factors to corrected barcode activities")
+}
+barcode_control_comparison_df <- barcode_control_comparison_df %>%
+    mutate(sample_log2_mean_RPM_corrected = sample_log2_mean_RPM + correction_delta) %>%
+    select(-correction_delta)
+
 barcode_control_comparison_df <- barcode_control_comparison_df %>%
         mutate(
                 deviation_corrected = sample_log2_mean_RPM_corrected - control_log2_mean_RPM,
@@ -1109,7 +1781,7 @@ barcode_control_comparison_df <- barcode_control_comparison_df %>%
         )
 
 # Fold the banana-corrected activity back into barcode_activity_df itself, replacing
-# log2_mean_RPM/mean_RPM for non-control samples with their corrected value. Control
+# log2_mean_RPM/mean_RPM for non-control samples with their corrected value. Reference
 # samples are the correction's fixed anchor and keep their originally measured value.
 message("==== Writing banana-corrected values back into barcode_activity_df")
 banana_corrected_lookup <- barcode_control_comparison_df %>%
@@ -1186,8 +1858,8 @@ for (page_idx in seq_along(barcode_control_pages)) {
         facet_wrap(~comparison, ncol = 5) +
         coord_equal() +
         theme_pubr(border = T) +
-        ggtitle(paste0("Barcode activities vs ", control_condition, " control (page ", page_idx, "/", length(barcode_control_pages), ")")) +
-        xlab(paste0(control_condition, " control barcode activity (log2 mean RPM)")) +
+        ggtitle(paste0("Barcode activities vs ", control_label, " (page ", page_idx, "/", length(barcode_control_pages), ")")) +
+        xlab(paste0(control_label, " barcode activity (log2 mean RPM)")) +
         ylab("Sample barcode activity (log2 mean RPM)") +
         theme(
             text = element_text(size = 14),
@@ -1329,8 +2001,8 @@ for (page_idx in seq_along(barcode_control_pages)) {
         facet_wrap(~comparison, ncol = 5) +
         coord_equal() +
         theme_pubr(border = T) +
-        ggtitle(paste0("Banana-corrected barcode activities vs ", control_condition, " control (page ", page_idx, "/", length(barcode_control_pages), ")")) +
-        xlab(paste0(control_condition, " control barcode activity (log2 mean RPM)")) +
+        ggtitle(paste0("Banana-corrected barcode activities vs ", control_label, " (page ", page_idx, "/", length(barcode_control_pages), ")")) +
+        xlab(paste0(control_label, " barcode activity (log2 mean RPM)")) +
         ylab("Sample barcode activity (log2 mean RPM), banana-corrected") +
         theme(
             text = element_text(size = 14),
@@ -1375,8 +2047,8 @@ for (page_idx in seq_along(barcode_control_pages)) {
         ) +
         facet_wrap(~comparison, ncol = 5) +
         theme_pubr(border = T) +
-        ggtitle(paste0("Residual barcode activity vs ", control_condition, " control (page ", page_idx, "/", length(barcode_control_pages), ")")) +
-        xlab(paste0(control_condition, " control barcode activity (log2 mean RPM)")) +
+        ggtitle(paste0("Residual barcode activity vs ", control_label, " (page ", page_idx, "/", length(barcode_control_pages), ")")) +
+        xlab(paste0(control_label, " barcode activity (log2 mean RPM)")) +
         ylab("Residual activity (sample - control, log2 mean RPM)") +
         theme(
             text = element_text(size = 14),

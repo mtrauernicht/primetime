@@ -19,6 +19,7 @@ get_arg <- function(flag) {
 opt <- list(
     results_file = get_arg("--results-file"),
     barcode_dir = get_arg("--barcode-dir"),
+    barcode_activity_file = get_arg("--barcode-activity-file"),
     reference_condition = get_arg("--reference-condition"),
     well_map = get_arg("--well-map"),
     output_dir = get_arg("--output-dir"),
@@ -195,10 +196,17 @@ if (!is.na(pDNA_path) && file.exists(pDNA_path)) {
     message("pDNA counts file not found at ", pDNA_path, " - replicate plots will fall back to RPM")
 }
 
-barcode_activity_path <- find_existing_path(c(
-    file.path(project_root, "tmp_primetime", "activity", "barcode_activity.txt"),
-    file.path(dirname(opt$output_dir), "tmp_primetime", "activity", "barcode_activity.txt")
-))
+barcode_activity_path <- if (
+    !is.na(opt$barcode_activity_file) &&
+    file.exists(opt$barcode_activity_file)
+) {
+    opt$barcode_activity_file
+} else {
+    find_existing_path(c(
+        file.path(project_root, "tmp_primetime", "activity", "barcode_activity.txt"),
+        file.path(dirname(opt$output_dir), "tmp_primetime", "activity", "barcode_activity.txt")
+    ))
+}
 if (!is.na(barcode_activity_path) && file.exists(barcode_activity_path)) {
     message("Loading barcode activity file from: ", barcode_activity_path)
     barcode_activity_df <- tryCatch({
@@ -287,6 +295,15 @@ well_to_coords <- function(well) {
     return(list(row = row_idx, col = col_num))
 }
 
+# Like normalize_label() but keeps trailing "-<digits>"/".<digits>", which are part of
+# condition names such as I-135 / I-138 and must stay distinct.
+normalize_condition_label <- function(x) {
+    x <- tolower(trimws(as.character(x)))
+    x <- gsub("[^a-z0-9]+", "_", x)
+    x <- gsub("_+", "_", x)
+    gsub("^_|_$", "", x)
+}
+
 normalize_label <- function(x) {
     x <- tolower(trimws(as.character(x)))
     x <- gsub("(_rep[0-9]+|_r[0-9]+|\\.[0-9]+|-[0-9]+)$", "", x, ignore.case = TRUE)
@@ -321,13 +338,13 @@ build_well_metadata <- function(well_mapping, design_data) {
         }
     }
 
-    well_meta$condition_key <- vapply(well_meta$condition, normalize_label, character(1))
+    well_meta$condition_key <- vapply(well_meta$condition, normalize_condition_label, character(1))
     well_meta$plate_key <- vapply(well_meta$plate_id, normalize_label, character(1))
     well_meta
 }
 
 match_condition_to_wells <- function(condition, plate_meta) {
-    condition_key <- normalize_label(condition)
+    condition_key <- normalize_condition_label(condition)
     if (is.na(condition_key) || condition_key == "") {
         return(character(0))
     }
@@ -443,11 +460,13 @@ build_condition_sign_lookup <- function(tf_results, reference_keys) {
     if (!any(ok)) return(empty)
 
     parts_mat <- do.call(rbind, parts_list[ok])
-    key1 <- normalize_label(parts_mat[, 1])
-    key2 <- normalize_label(parts_mat[, 2])
+    # Exact (case-insensitive) names: normalize_label() strips trailing "-<digits>" and would
+    # merge conditions such as I-135 and I-138 into one key, mixing up their colors.
+    key1 <- toupper(trimws(parts_mat[, 1]))
+    key2 <- toupper(trimws(parts_mat[, 2]))
 
-    is_ref1 <- key1 %in% reference_keys
-    is_ref2 <- key2 %in% reference_keys
+    is_ref1 <- key1 %in% toupper(reference_keys)
+    is_ref2 <- key2 %in% toupper(reference_keys)
     # condition_key is whichever side of the comparison is NOT the reference;
     # rows where both or neither side match the reference are dropped (mirrors
     # the original resolve_condition_sign(), which required exactly one match).
@@ -470,7 +489,7 @@ build_condition_sign_lookup <- function(tf_results, reference_keys) {
     setNames(sig_vals, rows$cond_key)
 }
 
-build_replicate_plot <- function(plot_df, title_text, include_violins) {
+build_replicate_plot <- function(plot_df, title_text, include_violins, y_limits = NULL) {
     color_map <- c(
         "Control condition" = "#000000",
         "NS" = "grey",
@@ -497,6 +516,10 @@ build_replicate_plot <- function(plot_df, title_text, include_violins) {
         p_rep <- p_rep +
             ggplot2::geom_boxplot(aes(fill = treatment_col), alpha = 0.3, outlier.size = 0.5) +
             scale_fill_manual(values = fill_map)
+    }
+
+    if (!is.null(y_limits) && length(y_limits) == 2 && all(is.finite(y_limits))) {
+        p_rep <- p_rep + coord_cartesian(ylim = y_limits)
     }
 
     p_rep
@@ -593,14 +616,14 @@ create_plate_overview <- function(tf_name, all_results, barcode_list, well_mappi
         summarise(avg_logFC = mean(logFC_numeric, na.rm = TRUE), .groups = "drop")
 
     if (nrow(avg_fc_by_condition) > 0) {
-        avg_fc_lookup <- setNames(avg_fc_by_condition$avg_logFC, normalize_label(avg_fc_by_condition$target_condition))
+        avg_fc_lookup <- setNames(avg_fc_by_condition$avg_logFC, normalize_condition_label(avg_fc_by_condition$target_condition))
         for (well_idx in seq_len(nrow(well_meta))) {
             well <- well_meta$well[well_idx]
             coords <- well_to_coords(well)
             if (is.na(coords$row) || is.na(coords$col)) {
                 next
             }
-            cond_key <- normalize_label(well_meta$condition[well_idx])
+            cond_key <- normalize_condition_label(well_meta$condition[well_idx])
             avg_fc_value <- unname(avg_fc_lookup[cond_key])
             if (length(avg_fc_value) == 0) {
                 avg_fc_value <- NA_real_
@@ -887,6 +910,16 @@ for (tf in all_tfs) {
 if (!is.null(replicate_by_tf)) {
     reference_keys <- c("dmso", "control", "ctrl")
     tf_results_by_tf <- split(all_results, all_results$tf)
+    tf_activity_ranges <- lapply(replicate_by_tf, function(tf_df) {
+        activity_range <- range(tf_df$activity_log2, na.rm = TRUE)
+        if (!all(is.finite(activity_range))) {
+            return(NULL)
+        }
+        if (diff(activity_range) == 0) {
+            activity_range <- activity_range + c(-0.25, 0.25)
+        }
+        activity_range
+    })
     replicate_chunks <- vector("list", length(all_tfs))
     chunk_idx <- 0L
 
@@ -918,7 +951,7 @@ if (!is.null(replicate_by_tf)) {
                 next
             }
 
-            sign <- unname(sign_lookup[normalize_label(condition_name)])
+            sign <- unname(sign_lookup[toupper(trimws(condition_name))])
             if (length(sign) == 0 || is.na(sign)) {
                 sign <- "NS"
             }
@@ -1002,7 +1035,8 @@ if (!is.null(replicate_by_tf)) {
                     tf_plot <- build_replicate_plot(
                         page_df,
                         title_text = paste0("Replicate activity: ", tf, " (page ", page_idx, ")"),
-                        include_violins = isTRUE(opt$replicate_include_violins)
+                        include_violins = isTRUE(opt$replicate_include_violins),
+                        y_limits = tf_activity_ranges[[tf]]
                     ) +
                         #facet_wrap(~condition, scales = "free_y", ncol = 3) +
                         theme(legend.position = "none")

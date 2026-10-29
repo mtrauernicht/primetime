@@ -55,7 +55,14 @@ viability_file_config = config.get("VIABILITY_FILE", "")
 viability_file = ",".join(str(path) for path in viability_file_config) if isinstance(viability_file_config, list) else str(viability_file_config).strip()
 sample_info_file = str(config.get("SAMPLE_INFO", "")).strip()
 normalize_counts = "TRUE" if config.get("NORMALIZE_COUNTS", True) else "FALSE"
+random_norm_method = str(config.get("RANDOM_NORM_METHOD", "median")).strip().lower()
 banana_correction = "TRUE" if config.get("BANANA_CORRECTION", True) else "FALSE"
+banana_reference_n = int(config.get("BANANA_REFERENCE_N", 3))
+banana_per_plate = "TRUE" if config.get("BANANA_PER_PLATE", False) else "FALSE"
+depth_normalization = "TRUE" if config.get("DEPTH_NORMALIZATION", False) else "FALSE"
+shrinkage = "TRUE" if config.get("SHRINKAGE", False) else "FALSE"
+banana_on_corrected = "TRUE" if config.get("BANANA_AFTER_CORRECTIONS", False) else "FALSE"
+barcode_offset_correction = "TRUE" if config.get("BARCODE_OFFSET_CORRECTION", False) else "FALSE"
 previous_tmp_primetime_dir = str(config.get("PREVIOUS_TMP_PRIMETIME_DIR", "")).strip()
 
 # Ensure all rule shell commands run with the project conda environment available even when
@@ -423,8 +430,12 @@ replicate_pattern = "(?:" + "|".join(re.escape(p) for p in plate_ids_to_use) + r
 rule all:
     input:
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
+        cDNA_baseline=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts_uncorrected.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
         qc=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
+        depth_correlation=os.path.join(output_dir, "primetime_QC/cDNA_depth_correlations.pdf"),
+        barcode_offset_correlation=os.path.join(output_dir, "primetime_QC/barcode_offset_correction.pdf"),
+        bleedthrough_all=os.path.join(output_dir, "primetime_QC/bleedthrough_estimation_all_reporters.pdf"),
         heatmap_comparisons=os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
         umap_plot=os.path.join(output_dir, "primetime_results/umap_conditions.pdf"),
         tf_specific_plots=os.path.join(output_dir, "primetime_results/tf_specific_plots"),
@@ -650,6 +661,8 @@ rule get_activity_and_qc_plots:
         ),
         read_counts=os.path.join(output_dir, "primetime_QC/read_counts.pdf"),
         bc_counts=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
+        depth_correlation=os.path.join(output_dir, "primetime_QC/cDNA_depth_correlations.pdf"),
+        barcode_offset_correlation=os.path.join(output_dir, "primetime_QC/barcode_offset_correction.pdf"),
         control_bc_corr=os.path.join(output_dir, "primetime_QC/control_barcode_correlations.pdf"),
         viability_heatmap=os.path.join(output_dir, "primetime_QC/viability_well_heatmap.pdf"),
         viability_qc=os.path.join(output_dir, "primetime_QC/read_counts_vs_viability.pdf"),
@@ -661,8 +674,16 @@ rule get_activity_and_qc_plots:
             output_dir, "tmp_primetime/activity/bleedthrough_per_condition.txt"
         ),
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
+        cDNA_baseline=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts_uncorrected.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
         barcode_activity=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
+        barcode_removal_report=os.path.join(output_dir, "tmp_primetime/activity/barcode_removal_report.tsv"),
+        depth_normalization_fits=os.path.join(output_dir, "tmp_primetime/activity/depth_normalization_fits.tsv"),
+        barcode_offset_correction_fits=os.path.join(output_dir, "tmp_primetime/activity/barcode_offset_correction_fits.tsv"),
+        shrinkage_fits=os.path.join(output_dir, "tmp_primetime/activity/shrinkage_fits.tsv"),
+        bleedthrough_all=os.path.join(output_dir, "primetime_QC/bleedthrough_estimation_all_reporters.pdf"),
+        bleedthrough_all_data=os.path.join(output_dir, "tmp_primetime/activity/bleedthrough_all_reporters_per_condition.txt"),
+        banana_reference_samples=os.path.join(output_dir, "tmp_primetime/activity/banana_reference_samples.tsv"),
         read_count_summary=os.path.join(output_dir, "tmp_primetime/activity/read_count_per_sample.tsv"),
         sample_viability_summary=os.path.join(output_dir, "tmp_primetime/activity/sample_viability_summary.tsv"),
     params:
@@ -676,6 +697,13 @@ rule get_activity_and_qc_plots:
         comparisons_file=comparisons_file,
         annotated_manifest=annotated_file_manifest,
         banana_correction=banana_correction,
+        banana_per_plate=banana_per_plate,
+        banana_on_corrected=banana_on_corrected,
+        plate_ids=",".join(sample_plate_ids),
+        depth_normalization=depth_normalization,
+        barcode_offset_correction=barcode_offset_correction,
+        shrinkage=shrinkage,
+        banana_reference_n=banana_reference_n,
     shell:
         """
         mkdir -p {params.plots_basedir}
@@ -698,9 +726,17 @@ rule get_activity_and_qc_plots:
             --activity_basedir {params.activity_basedir} \
             --expected_pdna {params.expected_pdna_counts} \
             --cdna_output {params.activity_basedir}/cDNA_counts.txt \
+            --cdna_baseline_output {params.activity_basedir}/cDNA_counts_uncorrected.txt \
             --barcode_activity_output {params.barcode_activity_output} \
             --comparisons {params.comparisons_file} \
             --banana_correction {params.banana_correction} \
+            --banana_per_plate {params.banana_per_plate} \
+            --banana_on_corrected {params.banana_on_corrected} \
+            --plate_ids {params.plate_ids} \
+            --depth_normalization {params.depth_normalization} \
+            --barcode_offset_correction {params.barcode_offset_correction} \
+            --shrinkage {params.shrinkage} \
+            --banana_reference_n {params.banana_reference_n} \
             "${{viability_args[@]}}"
 
         rm "$temp_file_list"
@@ -711,7 +747,9 @@ rule get_activity_and_qc_plots:
 rule run_comparative_analysis:
     input:
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
+        cDNA_baseline=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts_uncorrected.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
+        banana_reference=os.path.join(output_dir, "tmp_primetime/activity/banana_reference_samples.tsv"),
     output:
         txt=os.path.join(output_dir, "primetime_results/output_data/{contrast}_vs_{ref}.txt"),
         plots=os.path.join(output_dir, "primetime_results/volcano_plots/{contrast}_vs_{ref}.pdf"),
@@ -735,12 +773,17 @@ rule run_comparative_analysis:
         ),
         num_replicates_reference=lambda wildcards: len(sample_replicate_files[wildcards.ref]),
         normalize=normalize_counts,
+        random_norm_method=random_norm_method,
         banana_correction=banana_correction,
+        banana_per_plate=banana_per_plate,
+        banana_on_corrected=banana_on_corrected,
+        plate_ids=",".join(sample_plate_ids),
     threads: 1
     shell:
         """
         {RSCRIPT} {params.script} \
         --cdna {input.cDNA} \
+        --cdna_baseline {input.cDNA_baseline} \
         --pdna {input.pDNA} \
         --output {params.out_basedir} \
         --pval_threshold {params.pval_threshold} \
@@ -752,7 +795,12 @@ rule run_comparative_analysis:
         --num_replicates_reference {params.num_replicates_reference} \
         --plot_output {params.plot_output_dir} \
         --normalize {params.normalize} \
-        --banana_correction {params.banana_correction}
+        --random_norm_method {params.random_norm_method} \
+        --banana_correction {params.banana_correction} \
+        --banana_per_plate {params.banana_per_plate} \
+        --banana_on_corrected {params.banana_on_corrected} \
+        --plate_ids {params.plate_ids} \
+        --banana_reference_file {input.banana_reference}
         """
 
 ##########################################################################################
@@ -905,6 +953,7 @@ rule get_tf_specific_plots:
             for contrast in contrasts
         ),
         barcodes=path_to_annotated_dfs,
+        barcode_activity=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
         # TF-specific plate overview only visualizes one 384-well layout, so use the first
         # plate's SAMPLES_FILE for the well->sample mapping.
         well_map=plate_to_samples_file[sample_plate_ids[0]],
@@ -924,6 +973,7 @@ rule get_tf_specific_plots:
         {RSCRIPT} {params.r_script} \
             --results-file "$FILELIST" \
             --barcode-dir "$BARCODE_DIR" \
+            --barcode-activity-file {input.barcode_activity} \
             --well-map {input.well_map} \
             --output-dir {output}
         

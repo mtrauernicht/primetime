@@ -113,6 +113,76 @@ Example:
 NORMALIZE_COUNTS: True
 ```
 
+`RANDOM_NORM_METHOD` selects how the shift is estimated from the RANDOM (no-TF) reporters:
+- `median` (default): subtract the median of each promoter's RANDOM reporters.
+- `shrunk`: reporters are precision-weighted (BCalm standard error plus reporter-to-reporter excess variance), a pooled shift is estimated over all promoters, and each promoter's deviation from it is shrunk by `tau^2 / (tau^2 + se_p^2)` (`tau^2` = between-promoter variance). This reduces the noise from a few noisy RANDOM reporters while keeping promoter-specific shifts that are clearly supported by the data.
+
+```yaml
+RANDOM_NORM_METHOD: shrunk
+```
+
+Set `DEPTH_NORMALIZATION` to `True` to fit a TF-specific loess between cDNA RPM and
+sequencing depth, normalize cDNA counts toward the median sequencing depth, and
+generate the faceted diagnostic plot
+`primetime_QC/cDNA_depth_correlations.pdf`. The default is `False`.
+
+```yaml
+DEPTH_NORMALIZATION: False
+```
+
+Set `BARCODE_OFFSET_CORRECTION` to `True` to estimate stable barcode-specific
+offsets within each TF/promoter reporter from centered log2(cDNA/pDNA) activity
+and correct the cDNA counts while preserving each sample's overall activity.
+The diagnostic plot is written to
+`primetime_QC/barcode_offset_correction.pdf`. The default is `False`.
+
+```yaml
+BARCODE_OFFSET_CORRECTION: False
+```
+
+Set `SHRINKAGE` to `True` (screen pipeline only) to shrink noisy low-count TF
+measurements. For every TF and cDNA replicate, the log2 RPM of the barcode-summed
+count is compared with the TF's mean over the control replicates. A robust loess of
+that difference against the control level gives the replicate's own systematic shift
+(for example a lower floor for weakly active reporters). The shrinkage target is
+control mean + this trend, so only TF-specific noise is shrunk and the replicate-wide
+shift is left to the other corrections. The weight is `w = tv / (tv + nv)`, where
+`nv = 1 / (ln(2)^2 * count)` is the count-noise variance and `tv` is the median
+excess variance around the target across all TFs and replicates. Low-count
+measurements are shrunk hardest, which also damps real fold-changes of low-count TFs.
+Weights and factors are written to `tmp_primetime/activity/shrinkage_fits.tsv`.
+The default is `False`.
+
+```yaml
+SHRINKAGE: False
+```
+
+For the screen pipeline (`Snakefile_screen`), depth, shrinkage and barcode-offset factors are
+estimated independently from the same post-filter, uncorrected counts and then
+combined. Banana correction is also estimated from that uncorrected baseline before
+being applied to the corrected counts. This makes the QC activity outputs and
+comparative BCalm results independent of the order in which these corrections are
+applied in code. Because the estimates no longer depend on previously corrected
+counts, results can differ from runs made with earlier sequential fitting.
+
+The banana correction (`BANANA_CORRECTION`) uses as reference only the
+`BANANA_REFERENCE_N` (default `3`) control/DMSO replicates with the lowest pDNA
+bleed-through; all other samples, including the remaining DMSO replicates, are
+corrected against the mean of these. The selected replicates are listed in
+`tmp_primetime/activity/banana_reference_samples.tsv`. Set `BANANA_REFERENCE_N: 0`
+to use all control replicates. `primetime_QC/bleedthrough_estimation_all_reporters.pdf`
+shows the bleed-through fits using all reporters (the main
+`bleedthrough_estimation.pdf` uses negative controls only).
+
+Set `BANANA_PER_PLATE` to `True` to select the `BANANA_REFERENCE_N` anchors separately
+within each plate (`PLATES_FILE` plate ID) and correct every sample against the anchors of its own
+plate (in both the QC activity table and the BCalm analysis). Samples whose replicate name
+contains no plate ID, or on a plate without control replicates, use the global anchors. The default is `False`.
+
+```yaml
+BANANA_PER_PLATE: False
+```
+
 ## Optional: Changing the library information
 
 There are some additional parameters on the config file related to the barcodes used in the analysis
