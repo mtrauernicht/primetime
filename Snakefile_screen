@@ -1,3 +1,4 @@
+import shlex
 import sys
 import inspect
 import os
@@ -58,10 +59,9 @@ normalize_counts = "TRUE" if config.get("NORMALIZE_COUNTS", True) else "FALSE"
 random_norm_method = str(config.get("RANDOM_NORM_METHOD", "median")).strip().lower()
 banana_correction = "TRUE" if config.get("BANANA_CORRECTION", True) else "FALSE"
 banana_reference_n = int(config.get("BANANA_REFERENCE_N", 3))
-banana_per_plate = "TRUE" if config.get("BANANA_PER_PLATE", False) else "FALSE"
 depth_normalization = "TRUE" if config.get("DEPTH_NORMALIZATION", False) else "FALSE"
 shrinkage = "TRUE" if config.get("SHRINKAGE", False) else "FALSE"
-banana_on_corrected = "TRUE" if config.get("BANANA_AFTER_CORRECTIONS", False) else "FALSE"
+min_reads_per_replicate = int(config.get("MIN_READS_PER_REPLICATE", 0))
 barcode_offset_correction = "TRUE" if config.get("BARCODE_OFFSET_CORRECTION", False) else "FALSE"
 previous_tmp_primetime_dir = str(config.get("PREVIOUS_TMP_PRIMETIME_DIR", "")).strip()
 
@@ -439,6 +439,7 @@ rule all:
         heatmap_comparisons=os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
         umap_plot=os.path.join(output_dir, "primetime_results/umap_conditions.pdf"),
         tf_specific_plots=os.path.join(output_dir, "primetime_results/tf_specific_plots"),
+        shrinkage_qc=[os.path.join(output_dir, "primetime_QC/shrinkage_effect.pdf")] if shrinkage == "TRUE" else [],
         all_comparisons=[
             os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
             for ref, contrasts in comparisons_dict.items()
@@ -510,6 +511,7 @@ if run_demultiplexing:
                 out_base=demultiplex_dir,
                 plot_dir=os.path.join(output_dir, "primetime_QC"),
                 plate_id=plate_id,
+                rt_cluster_arg=lambda wildcards, input: f"--rt_cluster_file {shlex.quote(str(input.rt_cluster))}" if len(input.rt_cluster) > 0 else "",
             threads: 40
             shell:
                 """
@@ -531,7 +533,7 @@ if run_demultiplexing:
         --plate_id {params.plate_id} \
         --stats_file {output.done}.stats \
         --invalid_bc_file {output.done}.invalid.txt \
-        --rt_cluster_file {input.rt_cluster}
+        {params.rt_cluster_arg}
 
             touch {output.done}
                 """
@@ -559,13 +561,13 @@ rule get_barcode_counts:
     shell:
         """
         python {params.script} \
---fastq {input.fastq} \
+--fastq {input.fastq:q} \
 --bc_length {params.bc_length} \
 --bc_downstream_seq {params.bc_downstream_seq} \
 --max_mismatch {params.max_mismatch} \
 --threads {threads} \
---invalid_bc_file {output.invalid_bc_file} \
-> {output.txt} 2> {output.stats}
+--invalid_bc_file {output.invalid_bc_file:q} \
+> {output.txt:q} 2> {output.stats:q}
         """
 
 ##########################################################################################
@@ -590,15 +592,15 @@ rule cluster_barcodes:
     shell:
         """
         # First, repeat every BC on the annotation 10000 times
-        tail -n +2 {params.bc_annotation} | awk -v FS=',' '{{for(i=1;i<={params.amount_spikes};i++) print $1}}' > {output.tmp}
+        tail -n +2 {params.bc_annotation} | awk -v FS=',' '{{for(i=1;i<={params.amount_spikes};i++) print $1}}' > {output.tmp:q}
 
         # Now, concatenate the input and this and call starcode with standard clustering
-        cat {input} {output.tmp} | starcode \
+        cat {input:q} {output.tmp:q} | starcode \
         --threads {threads} \
         --print-clusters \
         --quiet \
         --dist 1 | \
-        sort -k1,1 > {output.clustered}
+        sort -k1,1 > {output.clustered:q}
         """
 # rule cluster_barcodes:
 #     input:
@@ -637,13 +639,13 @@ rule annotate_barcodes:
     shell:
         """
         {RSCRIPT} {params.script} \
---bc_counts {input.clustered} \
---stats {input.stats} \
+--bc_counts {input.clustered:q} \
+--stats {input.stats:q} \
 --amount_spikes {params.amount_spikes} \
 --bc_annotation {params.bc_annotation} \
---sample {wildcards.sample} \
---replicate_number {wildcards.replicate} \
---output {output}
+--sample {wildcards.sample:q} \
+--replicate_number {wildcards.replicate:q} \
+--output {output:q}
         """
 
 ##########################################################################################
@@ -680,7 +682,6 @@ rule get_activity_and_qc_plots:
         barcode_removal_report=os.path.join(output_dir, "tmp_primetime/activity/barcode_removal_report.tsv"),
         depth_normalization_fits=os.path.join(output_dir, "tmp_primetime/activity/depth_normalization_fits.tsv"),
         barcode_offset_correction_fits=os.path.join(output_dir, "tmp_primetime/activity/barcode_offset_correction_fits.tsv"),
-        shrinkage_fits=os.path.join(output_dir, "tmp_primetime/activity/shrinkage_fits.tsv"),
         bleedthrough_all=os.path.join(output_dir, "primetime_QC/bleedthrough_estimation_all_reporters.pdf"),
         bleedthrough_all_data=os.path.join(output_dir, "tmp_primetime/activity/bleedthrough_all_reporters_per_condition.txt"),
         banana_reference_samples=os.path.join(output_dir, "tmp_primetime/activity/banana_reference_samples.tsv"),
@@ -697,12 +698,10 @@ rule get_activity_and_qc_plots:
         comparisons_file=comparisons_file,
         annotated_manifest=annotated_file_manifest,
         banana_correction=banana_correction,
-        banana_per_plate=banana_per_plate,
-        banana_on_corrected=banana_on_corrected,
+        min_reads_per_replicate=min_reads_per_replicate,
         plate_ids=",".join(sample_plate_ids),
         depth_normalization=depth_normalization,
         barcode_offset_correction=barcode_offset_correction,
-        shrinkage=shrinkage,
         banana_reference_n=banana_reference_n,
     shell:
         """
@@ -730,12 +729,10 @@ rule get_activity_and_qc_plots:
             --barcode_activity_output {params.barcode_activity_output} \
             --comparisons {params.comparisons_file} \
             --banana_correction {params.banana_correction} \
-            --banana_per_plate {params.banana_per_plate} \
-            --banana_on_corrected {params.banana_on_corrected} \
+            --min_reads_per_replicate {params.min_reads_per_replicate} \
             --plate_ids {params.plate_ids} \
             --depth_normalization {params.depth_normalization} \
             --barcode_offset_correction {params.barcode_offset_correction} \
-            --shrinkage {params.shrinkage} \
             --banana_reference_n {params.banana_reference_n} \
             "${{viability_args[@]}}"
 
@@ -774,9 +771,8 @@ rule run_comparative_analysis:
         num_replicates_reference=lambda wildcards: len(sample_replicate_files[wildcards.ref]),
         normalize=normalize_counts,
         random_norm_method=random_norm_method,
+        shrinkage=shrinkage,
         banana_correction=banana_correction,
-        banana_per_plate=banana_per_plate,
-        banana_on_corrected=banana_on_corrected,
         plate_ids=",".join(sample_plate_ids),
     threads: 1
     shell:
@@ -796,9 +792,8 @@ rule run_comparative_analysis:
         --plot_output {params.plot_output_dir} \
         --normalize {params.normalize} \
         --random_norm_method {params.random_norm_method} \
+        --shrinkage {params.shrinkage} \
         --banana_correction {params.banana_correction} \
-        --banana_per_plate {params.banana_per_plate} \
-        --banana_on_corrected {params.banana_on_corrected} \
         --plate_ids {params.plate_ids} \
         --banana_reference_file {input.banana_reference}
         """
@@ -905,7 +900,7 @@ rule get_heatmap_of_conditions:
     shell:
         """
         FILELIST=$(mktemp)
-        printf '%s\n' {input.results} > "$FILELIST"
+        for f in {input.results}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
 
         sample_info_args=()
         if [[ -n "{params.sample_info}" ]]; then
@@ -919,6 +914,27 @@ rule get_heatmap_of_conditions:
             --output {output} \
             "${{sample_info_args[@]}}"
 
+        rm "$FILELIST"
+        """
+
+##########################################################################################
+# Post-BCalm shrinkage QC (only requested when SHRINKAGE is True)
+rule get_shrinkage_qc:
+    input:
+        results=expand(
+            os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        )
+    output:
+        os.path.join(output_dir, "primetime_QC/shrinkage_effect.pdf"),
+    params:
+        r_script=os.path.join(screen_scripts_dir, "primetime_get_shrinkage_qc.R"),
+    shell:
+        """
+        FILELIST=$(mktemp)
+        for f in {input.results}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
+        {RSCRIPT} {params.r_script} --results-file "$FILELIST" --output {output}
         rm "$FILELIST"
         """
 
@@ -938,7 +954,7 @@ rule get_pca_plot:
     shell:
         """
         FILELIST=$(mktemp)
-        printf '%s\n' {input.results} > "$FILELIST"
+        for f in {input.results}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
         {RSCRIPT} {params.r_script} --results-file "$FILELIST" --output {output}
         rm "$FILELIST"
         """
@@ -966,7 +982,7 @@ rule get_tf_specific_plots:
         mkdir -p {output}
         
         FILELIST=$(mktemp)
-        printf '%s\n' {input.results} > "$FILELIST"
+        for f in {input.results}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
         
         BARCODE_DIR=$(dirname {input.barcodes[0]})
         

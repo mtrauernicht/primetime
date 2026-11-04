@@ -134,6 +134,18 @@ if (nzchar(trimws(sample_info_path)) && file.exists(sample_info_path) && file.in
 sample_viability_lookup <- data.frame(sample_key = character(0), mean_viability = numeric(0))
 if (!is.null(sample_viability_summary_opt) && nzchar(trimws(sample_viability_summary_opt)) && file.exists(sample_viability_summary_opt) && file.info(sample_viability_summary_opt)$size > 0) {
     sample_viability_df <- suppressWarnings(read.delim(sample_viability_summary_opt, stringsAsFactors = FALSE, check.names = FALSE))
+    # Prefer viability as % of the DMSO mean (mean_viability_pct); fall back to the raw values.
+    if (all(c("sample", "mean_viability_pct") %in% colnames(sample_viability_df))) {
+        sample_viability_df$mean_viability <- sample_viability_df$mean_viability_pct
+    } else if (all(c("sample", "mean_viability") %in% colnames(sample_viability_df))) {
+        # Older runs only have the raw signal: express it relative to the DMSO mean (across plates).
+        raw_viability <- suppressWarnings(as.numeric(sample_viability_df$mean_viability))
+        dmso_raw <- mean(raw_viability[grepl("dmso", sample_viability_df$sample, ignore.case = TRUE)], na.rm = TRUE)
+        if (is.finite(dmso_raw) && dmso_raw > 0) {
+            message("Heatmap: no mean_viability_pct column; using raw viability as % of the DMSO mean")
+            sample_viability_df$mean_viability <- 100 * raw_viability / dmso_raw
+        }
+    }
     if (all(c("sample", "mean_viability") %in% colnames(sample_viability_df))) {
         sample_viability_lookup <- sample_viability_df %>%
             transmute(
@@ -167,9 +179,10 @@ for (this_comparison in result_files) {
     }
 
     new_df <- comparison_df %>%
-    select(tf, logFC, any_of(c("sig", pvalue_candidates))) %>%
+    select(tf, logFC, any_of(c("logFC_shrunk", "sig", pvalue_candidates))) %>%
         mutate(
-            logFC = as.numeric(logFC),
+            logFC_unshrunk = as.numeric(logFC),
+            logFC = if ("logFC_shrunk" %in% colnames(.)) as.numeric(logFC_shrunk) else as.numeric(logFC),
             sig = if ("sig" %in% colnames(.)) as.character(sig) else "NS",
             condition_raw = comparison_parts$contrast,
             reference_condition = comparison_parts$reference,
@@ -224,6 +237,14 @@ if (!is.na(pvalue_column) && nzchar(pvalue_column)) {
 heatmap_wide <- all_comparisons_df %>%
     group_by(sample_label, tf) %>%
     summarise(logFC = mean(logFC, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = tf, values_from = logFC, values_fill = 0)
+
+# With SHRINKAGE the result files carry logFC_shrunk: every heatmap uses the shrunk values and
+# the unshrunk values are drawn once as an extra first page.
+has_shrunk_values <- "logFC_shrunk" %in% colnames(all_comparisons_df)
+unshrunk_wide <- all_comparisons_df %>%
+    group_by(sample_label, tf) %>%
+    summarise(logFC = mean(logFC_unshrunk, na.rm = TRUE), .groups = "drop") %>%
     pivot_wider(names_from = tf, values_from = logFC, values_fill = 0)
 
 sig_wide <- all_comparisons_df %>%
@@ -350,6 +371,37 @@ row_annotation_df$sample_class <- ifelse(is.na(row_annotation_df$sample_class) |
 row_annotation_df$mean_viability <- suppressWarnings(as.numeric(row_annotation_df$mean_viability))
 row_annotation_df$read_count <- suppressWarnings(as.numeric(row_annotation_df$read_count))
 row_annotation_df$mean_viability[!is.finite(row_annotation_df$mean_viability)] <- 0
+
+# Viability annotation scale is fixed: 25% (white) to 100% (dark green), values outside are clamped.
+viability_scale_limits <- c(25, 100)
+row_annotation_df$mean_viability <- pmin(viability_scale_limits[2], pmax(viability_scale_limits[1], row_annotation_df$mean_viability))
+patch_pheatmap_fn <- function(fn_name, from, to) {
+    fn <- get(fn_name, envir = asNamespace("pheatmap"))
+    src <- paste(deparse(fn), collapse = "\n")
+    # Whitespace-insensitive literal match: deparse() inserts line breaks inside expressions.
+    tokens <- strsplit(trimws(from), "\\s+")[[1]]
+    escaped <- vapply(tokens, function(t) gsub("([^A-Za-z0-9_ ])", "\\\\\\1", t), character(1))
+    pattern <- paste(escaped, collapse = "\\s+")
+    loc <- regexpr(pattern, src, perl = TRUE)
+    if (loc == -1) {
+        warning("pheatmap internals changed; viability scale not fixed in ", fn_name)
+        return(invisible(NULL))
+    }
+    patched <- paste0(substr(src, 1, loc - 1), to, substr(src, loc + attr(loc, "match.length"), nchar(src)))
+    new_fn <- eval(parse(text = patched))
+    environment(new_fn) <- asNamespace("pheatmap")
+    utils::assignInNamespace(fn_name, new_fn, ns = "pheatmap")
+}
+patch_pheatmap_fn(
+    "convert_annotations",
+    "a = cut(a, breaks = 100)",
+    "a = cut(a, breaks = if (colnames(annotation)[i] == \"mean_viability\") seq(25, 100, length.out = 101) else 100, include.lowest = TRUE)"
+)
+patch_pheatmap_fn(
+    "draw_annotation_legend",
+    "txt = rev(range(grid.pretty(range(annotation[[i]], na.rm = TRUE))))",
+    "txt = rev(if (i == \"mean_viability\") c(25, 100) else range(grid.pretty(range(annotation[[i]], na.rm = TRUE))))"
+)
 row_annotation_df$read_count[!is.finite(row_annotation_df$read_count)] <- 0
 
 # Emphasize low-count samples: values above 50k are saturated to white in the annotation scale.
@@ -446,6 +498,29 @@ pdf(
     height = max(6, min(30, 3 + 0.45 * nrow(matrix_values)))
 )
 
+if (has_shrunk_values) {
+    matrix_unshrunk <- as.matrix(unshrunk_wide %>% select(-sample_label))
+    rownames(matrix_unshrunk) <- unshrunk_wide$sample_label
+    matrix_unshrunk <- matrix_unshrunk[rownames(matrix_values), colnames(matrix_values), drop = FALSE]
+    matrix_unshrunk[is.na(matrix_unshrunk)] <- 0
+    pheatmap(
+        matrix_unshrunk,
+        cluster_rows = if (nrow(matrix_unshrunk) >= 2) hclust(dist(matrix_unshrunk), method = "ward.D2") else FALSE,
+        cluster_cols = if (ncol(matrix_unshrunk) >= 2) hclust(dist(t(matrix_unshrunk)), method = "ward.D2") else FALSE,
+        annotation_row = row_annotation_df,
+        annotation_colors = annotation_colors,
+        border_color = NA,
+        color = colorRampPalette(c("#6495ed", "white", "#f37f80"))(100),
+        breaks = seq(-2, 2, length.out = 101),
+        main = "TF Fold-Change Heatmap Across Conditions (All Values, UNSHRUNK)",
+        cellwidth = 6,
+        cellheight = 6,
+        fontsize_row = 6,
+        fontsize_col = 6,
+        angle_col = 90
+    )
+}
+
 # Heatmap 1: full fold-change heatmap across all conditions (all values, none masked).
 pheatmap(
     matrix_values,
@@ -456,7 +531,7 @@ pheatmap(
     border_color = NA,
     color = colorRampPalette(c("#6495ed", "white", "#f37f80"))(100),
     breaks = seq(-2, 2, length.out = 101),
-    main = "TF Fold-Change Heatmap Across Conditions (All Values)",
+    main = paste0("TF Fold-Change Heatmap Across Conditions (All Values", if (has_shrunk_values) ", SHRUNK" else "", ")"),
     cellwidth = 6,
     cellheight = 6,
     fontsize_row = 6,

@@ -56,9 +56,8 @@ option_list <- list(
         make_option(c("--single_model"), type = "logical", default = FALSE, help = "Whether to make a single model for all the TFs or not"),
         make_option(c("--normalize"), type = "logical", default = TRUE, help = "Whether to normalize activities by promoter-specific negative controls"),
         make_option(c("--random_norm_method"), type = "character", default = "median", help = "RANDOM-reporter normalization: 'median' (per-promoter median) or 'shrunk' (precision-weighted pooled shift with shrunken promoter deviations)"),
-        make_option(c("--plate_ids"), type = "character", default = "", help = "Comma-separated sample plate IDs (PLATES_FILE) used to assign replicates to plates for --banana_per_plate"),
-        make_option(c("--banana_per_plate"), type = "logical", default = FALSE, help = "Whether to correct each plate against the banana anchors of that same plate"),
-        make_option(c("--banana_on_corrected"), type = "logical", default = FALSE, help = "Fit the banana correction on the depth/offset/shrinkage-corrected counts instead of the uncorrected baseline"),
+        make_option(c("--shrinkage"), type = "logical", default = FALSE, help = "Add empirical-Bayes shrunken logFC (computed after BCalm from logFC and its SE) to the output and show shrunk and unshrunk values in the plots"),
+        make_option(c("--plate_ids"), type = "character", default = "", help = "Comma-separated sample plate IDs (PLATES_FILE) used to assign replicates to plates for the per-plate banana anchors"),
         make_option(c("--banana_correction"), type = "logical", default = TRUE, help = "Whether to apply the banana-shaped bias correction to contrast vs reference barcode counts"),
         make_option(c("--banana_reference_file"), type = "character", default = NULL, help = "Optional TSV (column 'replicate') listing the low-bleedthrough control replicates used as the banana-correction anchor. If missing, the reference replicates are used")
 )
@@ -574,9 +573,35 @@ estimate_random_shifts <- function(y, se, promoter) {
                 row.names = NULL
         ) %>% mutate(pooled = mu, tau = sqrt(tau2))
 }
+# Adaptive-shrinkage-style empirical Bayes (ashr is not installed): zero-centred mixture of normals
+# prior learned from the observed logFC and their standard errors; returns posterior mean/sd.
+shrink_logfc <- function(beta, se, grid_mult = c(0, 0.25, 0.5, 1, 2, 4, 8, 16), n_iter = 500) {
+        ok <- is.finite(beta) & is.finite(se) & se > 0
+        out <- list(mean = rep(NA_real_, length(beta)), weight = rep(NA_real_, length(beta)))
+        if (sum(ok) < 10) {
+                return(out)
+        }
+        b <- beta[ok]
+        s <- se[ok]
+        sds <- sort(unique(c(0, min(s) * grid_mult[-1], median(s) * grid_mult[-1])))
+        marg_sd <- sqrt(outer(s^2, sds^2, "+"))
+        lik <- dnorm(b, 0, marg_sd)
+        pi_k <- rep(1 / length(sds), length(sds))
+        for (i in seq_len(n_iter)) {
+                resp <- sweep(lik, 2, pi_k, "*")
+                resp <- resp / pmax(rowSums(resp), 1e-300)
+                pi_k <- colMeans(resp)
+        }
+        resp <- sweep(lik, 2, pi_k, "*")
+        resp <- resp / pmax(rowSums(resp), 1e-300)
+        comp_w <- outer(rep(1, length(s)), sds^2) / marg_sd^2
+        w <- rowSums(resp * comp_w)
+        out$mean[ok] <- w * b
+        out$weight[ok] <- w
+        out
+}
 banana_correction <- isTRUE(opt$banana_correction)
-banana_per_plate <- isTRUE(opt$banana_per_plate)
-banana_on_corrected <- isTRUE(opt$banana_on_corrected)
+shrinkage <- isTRUE(opt$shrinkage)
 logfc_threshold <- if (normalize_counts) 0.263 else 0
 
 parse_replicate_arg <- function(value) {
@@ -627,6 +652,29 @@ if (anyDuplicated(cdna_keys) ||
 }
 cdna_baseline_all <- cdna_baseline_all[match(cdna_keys, baseline_keys), , drop = FALSE]
 extra_anchor_replicates <- intersect(extra_anchor_replicates, colnames(cdna_all))
+
+# Replicates removed upstream (e.g. MIN_READS_PER_REPLICATE) are no longer in the count tables.
+missing_replicates <- setdiff(c(ref_replicates, contrast_replicates), colnames(cdna_all))
+if (length(missing_replicates) > 0) {
+        message("Dropping replicates absent from the count tables (excluded upstream): ", paste(missing_replicates, collapse = ", "))
+        ref_replicates <- intersect(ref_replicates, colnames(cdna_all))
+        contrast_replicates <- intersect(contrast_replicates, colnames(cdna_all))
+}
+if (length(ref_replicates) == 0 || length(contrast_replicates) == 0) {
+        message("No replicates left for ", opt$contrast_condition, " vs ", opt$reference_condition, "; writing empty outputs")
+        for (d in c("volcano_plots", "lollipop_plots", "circular_lollipop_plots", "output_data")) {
+                dir.create(file.path(opt$plot_output, d), showWarnings = FALSE, recursive = TRUE)
+        }
+        nm <- paste0(opt$contrast_condition, "_vs_", opt$reference_condition)
+        file.create(file.path(opt$plot_output, "output_data", paste0(nm, ".txt")))
+        for (d in c("volcano_plots", "lollipop_plots", "circular_lollipop_plots")) {
+                pdf(file.path(opt$plot_output, d, paste0(nm, ".pdf")), width = 6, height = 3)
+                plot.new()
+                text(0.5, 0.5, paste(nm, "\nno replicates passed the read-count filter"))
+                invisible(dev.off())
+        }
+        quit(status = 0)
+}
 banana_anchor_replicates <- intersect(banana_anchor_replicates, c(ref_replicates, contrast_replicates, extra_anchor_replicates))
 cdna <- cdna_all %>%
         select(
@@ -865,9 +913,7 @@ print(head(this_cdna_matrix))
 this_cdna_matrix_precorrection <- this_cdna_matrix
 # Banana fitted on the depth/offset/shrinkage-corrected counts, so it only removes the
 # bias those corrections have not already explained.
-if (banana_on_corrected) {
-        this_cdna_baseline_matrix <- this_cdna_matrix_precorrection
-}
+this_cdna_baseline_matrix <- this_cdna_matrix_precorrection
 if (banana_correction) {
         message("---- Correcting banana-shaped bias (activity level: log2(cDNA_RPM/pDNA_RPM)) in contrast vs reference barcode counts")
         if (length(banana_anchor_replicates) > 0) {
@@ -877,7 +923,7 @@ if (banana_correction) {
                         this_cdna_matrix, this_pdna_matrix, banana_anchor_replicates,
                         list(ref_replicates, contrast_replicates),
                         baseline_cdna_matrix = this_cdna_baseline_matrix,
-                        per_plate = banana_per_plate
+                        per_plate = TRUE
                 )
         } else {
                 diag_ref_replicates <- ref_replicates
@@ -1090,6 +1136,41 @@ if (normalize_counts) {
                 )
 }
 
+# Post-BCalm shrinkage: inference (p-values, sig) stays on the unshrunk logFC.
+all_results$logFC_se <- unname(reporter_se[all_results$tf])
+if (shrinkage) {
+        message("==== Shrinking logFC after BCalm (empirical Bayes, prior learned from non-RANDOM TFs)")
+        real_mask <- !grepl("RANDOM", all_results$tf, ignore.case = TRUE)
+        # The BCalm SE is not calibrated (barcodes are shared between conditions but modelled as
+        # independent groups), so z = logFC / SE of the RANDOM reporters (true nulls) is rescaled to unit spread.
+        random_z <- (all_results$logFC / all_results$logFC_se)[!real_mask]
+        random_z <- random_z[is.finite(random_z)]
+        se_scale <- if (length(random_z) >= 10) min(max(1.4826 * mad(random_z, constant = 1), 0.3), 1) else 1
+        all_results$se_scale <- se_scale
+        message("SE calibration factor from RANDOM reporters: ", round(se_scale, 3))
+        shrunk <- shrink_logfc(all_results$logFC[real_mask], all_results$logFC_se[real_mask] * se_scale)
+        all_results$logFC_shrunk <- NA_real_
+        all_results$shrink_weight <- NA_real_
+        all_results$logFC_shrunk[real_mask] <- shrunk$mean
+        all_results$shrink_weight[real_mask] <- shrunk$weight
+        all_results$logFC_shrunk[!real_mask] <- all_results$logFC[!real_mask]
+        all_results[[paste0(contrast_condition, "_shrunk")]] <- all_results[[reference_condition]] + all_results$logFC_shrunk
+        message("Mean shrink weight: ", round(mean(shrunk$weight, na.rm = TRUE), 3),
+                "; fraction of TFs with w < 0.5: ", round(mean(shrunk$weight < 0.5, na.rm = TRUE), 3))
+}
+
+# Each plot is drawn for the unshrunk values and, if SHRINKAGE, once more for the shrunk values.
+all_results_full <- all_results
+plot_variants <- list(unshrunk = all_results_full)
+if (shrinkage) {
+        plot_variants$shrunk <- all_results_full %>%
+                mutate(
+                        logFC = ifelse(is.finite(logFC_shrunk), logFC_shrunk, logFC),
+                        !!contrast_condition := !!sym(reference_condition) + logFC
+                )
+}
+variant_label <- function(name) if (name == "shrunk") " [shrunk]" else if (shrinkage) " [unshrunk]" else ""
+
 ##########################################################################################
 # Plot results ###########################################################################
 ##########################################################################################
@@ -1105,7 +1186,9 @@ plot_title <- paste(opt$contrast_condition, "vs.", opt$reference_condition, "(p.
 message("Plot title:", plot_title)
 
 
-all_results %>%
+for (variant in names(plot_variants)) {
+all_results <- plot_variants[[variant]]
+print(all_results %>%
         ggplot(aes(x = logFC, y = -log10(p_adjusted), color = sig, alpha = sig, tf=tf)) +
         geom_hline(yintercept = -log10(p_threshold), linetype = "dashed", color = "grey") +
         geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
@@ -1120,15 +1203,18 @@ all_results %>%
         labs(
                 x = expression(log[2]("Fold Change")),
                 y = expression(-log[10]("Adjusted p-value")),
-                title = plot_title,
+                title = paste0(plot_title, variant_label(variant)),
         ) +
         guides(color = "none", alpha = "none") +
-        theme(text = element_text(size = 18))
+        theme(text = element_text(size = 18)))
+}
 invisible(dev.off())
 
 # Plotting lollipop plot
 pdf(file.path(opt$plot_output, "lollipop_plots/", output_pdf_name), width = 21, height = 7)
 
+for (variant in names(plot_variants)) {
+all_results <- plot_variants[[variant]]
 all_results %>%
         filter(!grepl("RANDOM", tf)) %>%
         mutate(color_axis = ifelse(sig == "Upregulated", "#f37f80",
@@ -1143,7 +1229,7 @@ all_results %>%
            mutate(tf = factor(tf, levels = unique(tf))) -> plot_df
 
 
-plot_df %>%
+print(plot_df %>%
             ggplot() +
             geom_segment(aes(
                 y = !!sym(reference_condition), 
@@ -1174,12 +1260,15 @@ plot_df %>%
             labs(
                 y = "Activity (log2(RPM+1))",
                 x = "",
-                                title= paste(contrast_condition, "vs.", reference_condition)
-            )
+                                title= paste0(contrast_condition, " vs. ", reference_condition, variant_label(variant))
+            ))
+}
 invisible(dev.off())
 
 pdf(file.path(opt$plot_output, "circular_lollipop_plots/", output_pdf_name), width = 14, height = 14)
 
+for (variant in names(plot_variants)) {
+all_results <- plot_variants[[variant]]
 circular_plot_df <-
         all_results %>%
         filter(!grepl("RANDOM", tf)) %>%
@@ -1326,14 +1415,16 @@ if (nrow(circular_plot_df) > 0) {
                 labs(
                                         y = "Fold change (log2)",
                         x = "",
-                        title = paste(contrast_condition, "vs.", reference_condition)
+                        title = paste0(contrast_condition, " vs. ", reference_condition, variant_label(variant))
                 )
 
         print(p_circular)
 }
+}
 
 invisible(dev.off())
 
+all_results <- all_results_full
 all_results %>%
         select(-AveExpr, -t, -adj.P.Val, -B) %>%
         write.table(file.path(opt$plot_output, 'output_data', output_txt_name), sep = "\t", quote = FALSE, row.names = FALSE)

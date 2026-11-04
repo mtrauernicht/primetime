@@ -140,24 +140,28 @@ The diagnostic plot is written to
 BARCODE_OFFSET_CORRECTION: False
 ```
 
-Set `SHRINKAGE` to `True` (screen pipeline only) to shrink noisy low-count TF
-measurements. For every TF and cDNA replicate, the log2 RPM of the barcode-summed
-count is compared with the TF's mean over the control replicates. A robust loess of
-that difference against the control level gives the replicate's own systematic shift
-(for example a lower floor for weakly active reporters). The shrinkage target is
-control mean + this trend, so only TF-specific noise is shrunk and the replicate-wide
-shift is left to the other corrections. The weight is `w = tv / (tv + nv)`, where
-`nv = 1 / (ln(2)^2 * count)` is the count-noise variance and `tv` is the median
-excess variance around the target across all TFs and replicates. Low-count
-measurements are shrunk hardest, which also damps real fold-changes of low-count TFs.
-Weights and factors are written to `tmp_primetime/activity/shrinkage_fits.tsv`.
-The default is `False`.
+Set `SHRINKAGE` to `True` (screen pipeline only) to add an empirical-Bayes shrinkage of
+the TF log2 fold-changes. It runs after BCalm and never touches the counts or the
+statistics: p-values, FDR and the `Upregulated`/`Downregulated` calls stay on the
+unshrunk logFC. For every contrast, a zero-centred mixture-of-normals prior
+(adaptive-shrinkage style, learned from the logFC and standard errors of all non-RANDOM
+TFs) gives a posterior-mean `logFC_shrunk`. Noisy estimates (large SE) are pulled towards 0,
+precise ones are left almost unchanged. The `output_data` tables gain the columns `logFC_se`,
+`logFC_shrunk`, `shrink_weight` (1 = no shrinkage) and `<contrast>_shrunk` (activity). The
+volcano, lollipop and circular lollipop PDFs get a second page with the shrunk values, and
+`heatmap_comparisons.pdf` shows the unshrunk heatmap once (first page) while all other
+heatmaps use the shrunk values. The BCalm standard errors are conservative (barcodes are shared
+between conditions but modelled as independent groups), so the SEs are first rescaled by the spread of
+the z-scores (logFC / SE) of the RANDOM reporters, which are true nulls (factor in `se_scale`, capped at 1).
+`primetime_QC/shrinkage_effect.pdf` (and a per-contrast `.tsv`) summarises the effect: shrunk vs unshrunk
+logFC, weight vs SE and |logFC|, weights and SE scale per contrast, and how many significant hits
+fall below the logFC cutoff after shrinkage. The default is `False`.
 
 ```yaml
 SHRINKAGE: False
 ```
 
-For the screen pipeline (`Snakefile_screen`), depth, shrinkage and barcode-offset factors are
+For the screen pipeline (`Snakefile_screen`), depth and barcode-offset factors are
 estimated independently from the same post-filter, uncorrected counts and then
 combined. Banana correction is also estimated from that uncorrected baseline before
 being applied to the corrected counts. This makes the QC activity outputs and
@@ -166,22 +170,24 @@ applied in code. Because the estimates no longer depend on previously corrected
 counts, results can differ from runs made with earlier sequential fitting.
 
 The banana correction (`BANANA_CORRECTION`) uses as reference only the
-`BANANA_REFERENCE_N` (default `3`) control/DMSO replicates with the lowest pDNA
-bleed-through; all other samples, including the remaining DMSO replicates, are
+`BANANA_REFERENCE_N` (default `3`) control replicates with the lowest pDNA
+bleed-through (per plate); control replicates are all conditions whose name contains
+`control`, `ctrl`, `dmso`, `no_treatment`, `untreated` or `vehicle`, pooled together; all other samples, including the remaining DMSO replicates, are
 corrected against the mean of these. The selected replicates are listed in
 `tmp_primetime/activity/banana_reference_samples.tsv`. Set `BANANA_REFERENCE_N: 0`
 to use all control replicates. `primetime_QC/bleedthrough_estimation_all_reporters.pdf`
 shows the bleed-through fits using all reporters (the main
 `bleedthrough_estimation.pdf` uses negative controls only).
 
-Set `BANANA_PER_PLATE` to `True` to select the `BANANA_REFERENCE_N` anchors separately
-within each plate (`PLATES_FILE` plate ID) and correct every sample against the anchors of its own
-plate (in both the QC activity table and the BCalm analysis). Samples whose replicate name
-contains no plate ID, or on a plate without control replicates, use the global anchors. The default is `False`.
+The `BANANA_REFERENCE_N` anchors are selected separately within each plate (`PLATES_FILE` plate ID)
+and every sample is corrected against the anchors of its own plate (in both the QC activity table
+and the BCalm analysis). Samples whose replicate name contains no plate ID, or on a plate without
+control replicates, use the global anchors.
 
-```yaml
-BANANA_PER_PLATE: False
-```
+When `BANANA_CORRECTION` is `True`, the banana is fitted on counts that already carry the depth,
+barcode-offset corrections (not on the uncorrected baseline). Depth and banana both
+remove the low-activity floor of high-depth samples, so this way the banana only removes what is
+left and the same bias is not corrected twice. The result is independent of the order of the YAML flags.
 
 ## Optional: Changing the library information
 
