@@ -49,8 +49,10 @@ option_list <- list(
     make_option(c("--banana_reference_n"), type = "integer", default = 3, help = "Number of control (DMSO) replicates with the lowest pDNA bleed-through used as the banana-correction reference (<= 0 or more than available: use all control replicates)"),
     make_option(c("--plate_ids"), type = "character", default = "", help = "Comma-separated sample plate IDs (PLATES_FILE) used to assign replicates to plates for the per-plate banana anchors"),
     make_option(c("--min_reads_per_replicate"), type = "numeric", default = 0, help = "Exclude cDNA replicates with fewer than this many reads (before barcode filtering) from all downstream analysis; 0 disables"),
+    make_option(c("--max_bleedthrough"), type = "numeric", default = 0.5, help = "Maximum negative-control bleed-through slope before barcode filtering (0.5 = 50%%); -1 disables"),
     make_option(c("--banana_correction"), type = "logical", default = TRUE, help = "Whether to apply the banana-shaped bias correction (loess sample-to-control normalization) to barcode activity"),
     make_option(c("--depth_normalization"), type = "logical", default = FALSE, help = "Whether to normalize cDNA counts for TF-specific sequencing-depth-dependent activity"),
+    make_option(c("--skip_correction_plots"), type = "logical", default = FALSE, help = "Do not write the cDNA_depth_correlations.pdf and barcode_offset_correction.pdf diagnostics"),
     make_option(c("--barcode_offset_correction"), type = "logical", default = FALSE, help = "Whether to correct stable barcode-specific activity offsets within each TF/promoter reporter")
 )
 
@@ -118,6 +120,33 @@ lower_diag_plot <- function(data, mapping, ...) {
             slope = 1,
             lty = "dashed",
             col = "red"
+        ) +
+        theme_pubr(border = TRUE)
+}
+
+# Lower panel with the most deviating barcodes (robust z of the x-y difference > 3) labeled by TF
+lower_diag_plot_labeled <- function(data, mapping, max_labels = 8, ...) {
+    x <- eval_data_col(data, mapping$x)
+    y <- eval_data_col(data, mapping$y)
+    d <- y - x
+    spread <- 1.4826 * mad(d, na.rm = TRUE)
+    z <- if (is.finite(spread) && spread > 0) abs(d - median(d, na.rm = TRUE)) / spread else rep(0, length(d))
+    z[!is.finite(z)] <- 0
+    label_idx <- head(order(-z), max_labels)
+    label_idx <- label_idx[z[label_idx] > 3]
+    label_df <- data.frame(x = x[label_idx], y = y[label_idx], label = data$tf_label[label_idx])
+
+    ggplot(data = data, mapping = mapping) +
+        geom_point(alpha = 0.5, size = 0.7, ...) +
+        geom_abline(slope = 1, lty = "dashed", col = "red") +
+        geom_text_repel(
+            data = label_df,
+            aes(x = x, y = y, label = label),
+            inherit.aes = FALSE,
+            size = 2.5,
+            max.overlaps = Inf,
+            min.segment.length = 0,
+            segment.color = "grey50"
         ) +
         theme_pubr(border = TRUE)
 }
@@ -538,6 +567,168 @@ opt <- parse_args(opt_parser)
 banana_correction <- isTRUE(opt$banana_correction)
 depth_normalization <- isTRUE(opt$depth_normalization)
 barcode_offset_correction <- isTRUE(opt$barcode_offset_correction)
+write_correction_plots <- !isTRUE(opt$skip_correction_plots)
+
+estimate_early_bleedthrough <- function(counts) {
+    pdna <- counts %>%
+        filter(pDNA) %>%
+        group_by(barcode) %>%
+        summarise(pdna_rpm = mean(RPM), .groups = "drop")
+    if (nrow(pdna) == 0) {
+        stop("Cannot estimate bleed-through: no pDNA barcode counts are available")
+    }
+    replicates <- counts %>% filter(!pDNA) %>% distinct(sample, replicate)
+    if (nrow(replicates) == 0) {
+        stop("Cannot estimate bleed-through: no cDNA replicates remain")
+    }
+    controls <- counts %>%
+        filter(!pDNA, negative_control) %>%
+        inner_join(pdna, by = "barcode")
+    bind_rows(lapply(seq_len(nrow(replicates)), function(i) {
+        sample_name <- replicates$sample[i]
+        replicate_name <- replicates$replicate[i]
+        d <- controls %>%
+            filter(replicate == replicate_name, is.finite(RPM), is.finite(pdna_rpm))
+        if (nrow(d) < 2 || n_distinct(d$pdna_rpm) < 2) {
+            stop("Cannot estimate bleed-through for replicate ", replicate_name,
+                 ": insufficient matched negative-control barcodes or pDNA variation")
+        }
+        fit <- lm(RPM ~ pdna_rpm, data = d)
+        slope <- unname(coef(fit)[["pdna_rpm"]])
+        if (!is.finite(slope)) {
+            stop("Cannot estimate bleed-through for replicate ", replicate_name, ": non-finite slope")
+        }
+        data.frame(sample = sample_name, replicate = replicate_name, slope = slope,
+                   intercept = unname(coef(fit)[["(Intercept)"]]), n_controls = nrow(d))
+    }))
+}
+
+raw_random_rpm <- function(data, count_col, neg_ctrl_col, sample, replicate) {
+    counts <- as.numeric(data[[count_col]])
+    if (any(!is.finite(counts)) || any(counts < 0)) {
+        stop("Invalid raw counts for replicate ", replicate)
+    }
+    library_size <- sum(counts)
+    if (library_size == 0) {
+        warning("Cannot plot raw RPM for replicate ", replicate, ": total count is zero")
+        return(data.frame(condition = character(), replicate = character(), tf = character(),
+                          promoter = character(), barcode = character(), rpm = numeric()))
+    }
+    is_random <- data[[neg_ctrl_col]] == "Yes" & grepl("RANDOM", data$tf, ignore.case = TRUE)
+    is_random[is.na(is_random)] <- FALSE
+    data.frame(
+        condition = rep(sample, sum(is_random)),
+        replicate = rep(replicate, sum(is_random)),
+        tf = data$tf[is_random],
+        promoter = data$promoter[is_random],
+        barcode = data$barcode[is_random],
+        rpm = counts[is_random] / library_size * 1e6
+    )
+}
+
+read_comparison_rows <- function(path) {
+    if (is.null(path) || !nzchar(path) || !file.exists(path)) {
+        stop("A valid --comparisons file is required for the raw RANDOM reporter QC plot: ", path)
+    }
+    rows <- lapply(strsplit(readLines(path, warn = FALSE), "\t", fixed = TRUE), function(row) {
+        row <- trimws(row)
+        row[nzchar(row)]
+    })
+    rows <- Filter(function(row) length(row) >= 2, rows)
+    if (length(rows) == 0) {
+        stop("No reference/contrast comparisons found in ", path)
+    }
+    names(rows) <- vapply(rows, `[`, character(1), 1)
+    rows[!duplicated(names(rows), fromLast = TRUE)]
+}
+
+plot_raw_random_rpm <- function(data, output_file, comparison_rows) {
+    pdf(output_file, width = 16, height = 12)
+    on.exit(dev.off())
+    if (nrow(data) == 0) {
+        message("No RANDOM negative-control reporters found in the cDNA inputs")
+        plot.new()
+        text(0.5, 0.5, "No RANDOM negative-control reporters found in cDNA inputs")
+        return(invisible(NULL))
+    }
+    if (anyNA(data$promoter) || any(!nzchar(as.character(data$promoter)))) {
+        stop("RANDOM control reporters must have a promoter annotation")
+    }
+    data$promoter <- factor(data$promoter, levels = sort(unique(data$promoter)))
+    reporters <- sort(unique(data$tf))
+    reporter_colors <- setNames(scales::hue_pal()(length(reporters)), reporters)
+    for (row in comparison_rows) {
+        reference <- row[1]
+        contrasts <- unique(setdiff(row[-1], reference))
+        if (length(contrasts) == 0) {
+            warning("No distinct contrasts for reference ", reference)
+            next
+        }
+        missing_conditions <- setdiff(c(reference, contrasts), unique(data$condition))
+        if (length(missing_conditions) > 0) {
+            warning("No raw RANDOM reporter counts for: ", paste(missing_conditions, collapse = ", "))
+        }
+        reference_values <- data %>%
+            filter(condition == reference) %>%
+            group_by(tf, promoter, barcode) %>%
+            summarise(reference_log2_rpm = median(log2(rpm + 1)), .groups = "drop")
+        contrast_pages <- split(contrasts, ceiling(seq_along(contrasts) / 14))
+        for (page_idx in seq_along(contrast_pages)) {
+            conditions <- c(reference, contrast_pages[[page_idx]])
+            page_data <- data[data$condition %in% conditions, , drop = FALSE]
+            if (nrow(page_data) == 0) {
+                plot.new()
+                title(main = paste("RANDOM reporter changes: reference", reference))
+                text(0.5, 0.5, "No RANDOM reporter counts available for these conditions")
+                next
+            }
+            page_data$condition <- factor(page_data$condition, levels = conditions)
+            relative_data <- page_data %>%
+                left_join(reference_values, by = c("tf", "promoter", "barcode")) %>%
+                mutate(log2_shift = log2(rpm + 1) - reference_log2_rpm)
+            missing_reference <- sum(is.na(relative_data$reference_log2_rpm))
+            if (missing_reference > 0) {
+                warning(missing_reference, " barcode measurements have no matching reference for ", reference,
+                        " on page ", page_idx, "; omitted from the relative plot")
+                relative_data <- relative_data %>% filter(!is.na(reference_log2_rpm))
+            }
+            if (nrow(relative_data) == 0) {
+                plot.new()
+                title(main = paste("RANDOM reporter changes: reference", reference))
+                text(0.5, 0.5, "No barcode measurements matched the reference condition")
+                next
+            }
+            relative_medians <- relative_data %>%
+                group_by(promoter, condition) %>%
+                summarise(median_shift = median(log2_shift), .groups = "drop")
+            print(
+                ggplot(relative_data, aes(x = condition, y = log2_shift)) +
+                    annotate("rect", xmin = 0.5, xmax = 1.5, ymin = -Inf, ymax = Inf,
+                             fill = "grey90") +
+                    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+                    geom_point(aes(color = tf),
+                               position = position_jitter(width = 0.2, height = 0, seed = 1),
+                               alpha = 0.65, size = 1.4) +
+                    geom_point(data = relative_medians, aes(y = median_shift),
+                               shape = 23, fill = "black", color = "white", size = 2.8,
+                               stroke = 0.5) +
+                    facet_wrap(~promoter, ncol = 1, drop = FALSE) +
+                    scale_x_discrete(drop = FALSE) +
+                    scale_color_manual(values = reporter_colors) +
+                    labs(
+                        title = paste0("RANDOM reporter changes: reference ", reference,
+                                       " (page ", page_idx, "/", length(contrast_pages), ")"),
+                        subtitle = "Per barcode relative to reference median; black diamonds are condition medians",
+                        x = "Condition", y = "log2(RPM + 1) difference vs reference",
+                        color = "Reporter"
+                    ) +
+                    theme_pubr(border = TRUE) +
+                    theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 7))
+            )
+        }
+    }
+    invisible(NULL)
+}
 
 if (!is.null(opt$plots_basedir) && nzchar(opt$plots_basedir)) {
     dir.create(opt$plots_basedir, recursive = TRUE, showWarnings = FALSE)
@@ -566,7 +757,10 @@ parse_annotated_entry <- function(entry) {
 }
 
 counts_df = data.frame()
+raw_random_counts <- vector("list", length(unique_files))
+file_index <- 0L
 for(entry in unique_files){
+    file_index <- file_index + 1L
     parsed_entry <- parse_annotated_entry(entry)
     l <- parsed_entry$path
     if (!is.na(parsed_entry$sample) && !is.na(parsed_entry$replicate)) {
@@ -603,6 +797,11 @@ for(entry in unique_files){
     } else {
         stop("Annotated file is missing a negative-control column: ", l)
     }
+    if (this_sample != "pDNA") {
+        raw_random_counts[[file_index]] <- raw_random_rpm(
+            this_replicate_df, count_col, neg_ctrl_col, this_sample, this_replicate
+        )
+    }
     # ADD PSEUDOCOUNT OF 1!!!!
     this_replicate_df[[count_col]] <- as.numeric(this_replicate_df[[count_col]]) + 1
     is_pDNA = this_sample == "pDNA"
@@ -628,6 +827,13 @@ for(entry in unique_files){
 
 }
 
+message("==== Plotting raw RANDOM reporter RPM")
+plot_raw_random_rpm(
+    bind_rows(raw_random_counts),
+    file.path(opt$plots_basedir, "raw_random_reporter_rpm.pdf"),
+    read_comparison_rows(opt$comparisons)
+)
+
 if (isTRUE(opt$min_reads_per_replicate > 0)) {
     replicate_read_totals <- counts_df %>%
         filter(!pDNA) %>%
@@ -642,6 +848,34 @@ if (isTRUE(opt$min_reads_per_replicate > 0)) {
     )
     message("==== Excluding ", nrow(low_read_replicates), " cDNA replicates with < ", opt$min_reads_per_replicate, " reads")
     counts_df <- counts_df %>% filter(pDNA | !replicate %in% low_read_replicates$replicate)
+}
+
+if (length(opt$max_bleedthrough) != 1 || !is.finite(opt$max_bleedthrough) ||
+    (opt$max_bleedthrough < 0 && opt$max_bleedthrough != -1)) {
+    stop("--max_bleedthrough must be a non-negative finite fraction, or -1 to disable")
+}
+early_bleedthrough <- if (opt$max_bleedthrough == -1) {
+    data.frame(sample = character(), replicate = character(), slope = numeric(),
+               intercept = numeric(), n_controls = integer())
+} else {
+    estimate_early_bleedthrough(counts_df)
+}
+early_bleedthrough$excluded <- early_bleedthrough$slope > opt$max_bleedthrough
+write.table(
+    early_bleedthrough,
+    file = file.path(opt$activity_basedir, "bleedthrough_filter_estimates.tsv"),
+    row.names = FALSE, quote = FALSE, sep = "\t"
+)
+excluded_bleedthrough <- early_bleedthrough %>% filter(excluded)
+write.table(
+    excluded_bleedthrough,
+    file = file.path(opt$activity_basedir, "excluded_high_bleedthrough_replicates.tsv"),
+    row.names = FALSE, quote = FALSE, sep = "\t"
+)
+message("==== Excluding ", nrow(excluded_bleedthrough), " cDNA replicates above the bleed-through cutoff")
+counts_df <- counts_df %>% filter(pDNA | !replicate %in% excluded_bleedthrough$replicate)
+if (!any(!counts_df$pDNA)) {
+    stop("No cDNA replicates remain after read-count and bleed-through filtering")
 }
 
 pdna_rpm_by_barcode <- counts_df %>%
@@ -742,7 +976,7 @@ plate_key <- function(x) {
 message("==== Fitting TF-specific cDNA activity versus sequencing depth")
 depth_fit_df <- fit_depth_normalization(
     normalization_baseline_counts,
-    file.path(opt$plots_basedir, "cDNA_depth_correlations.pdf"),
+    if (write_correction_plots) file.path(opt$plots_basedir, "cDNA_depth_correlations.pdf") else NULL,
     enabled = depth_normalization
 )
 write.table(
@@ -760,7 +994,7 @@ if (!depth_normalization) {
 message("==== Estimating barcode-specific activity offsets")
 barcode_offset_df <- fit_barcode_offsets(
     normalization_baseline_counts,
-    file.path(opt$plots_basedir, "barcode_offset_correction.pdf"),
+    if (write_correction_plots) file.path(opt$plots_basedir, "barcode_offset_correction.pdf") else NULL,
     enabled = barcode_offset_correction
 )
 write.table(
@@ -1103,8 +1337,8 @@ viability_paths <- if (is.null(opt$viability_file) || !nzchar(trimws(opt$viabili
 viability_paths <- viability_paths[viability_paths != ""]
 viability_matrices <- lapply(seq_along(viability_paths), function(plate_index) {
     viability_df <- read_viability_matrix(viability_paths[plate_index])
-    if (is.null(viability_df)) {
-        message("==== Skipping missing or empty viability file: ", viability_paths[plate_index])
+    if (is.null(viability_df) || nrow(viability_df) == 0) {
+        message("==== Skipping missing or empty viability file (expected a semicolon-separated plate matrix): ", viability_paths[plate_index])
         return(NULL)
     }
     viability_df %>%
@@ -1577,52 +1811,71 @@ replicate_condition_lookup <- counts_df %>%
     distinct(replicate, sample) %>%
     rename(cDNA_sample = replicate, condition = sample)
 
-# Control conditions (DMSO, no_treatment, ...) are pooled when picking the banana anchors.
-control_pattern <- "control|ctrl|dmso|no[_ .-]?treat|untreat|vehicle"
-control_conditions <- unique(replicate_condition_lookup$condition[str_detect(str_to_lower(replicate_condition_lookup$condition), control_pattern)])
-if (length(control_conditions) == 0) {
-    control_conditions <- replicate_condition_lookup$condition[1]
-}
-control_condition <- paste(control_conditions, collapse = " + ")
-
-control_replicates <-
-    replicate_condition_lookup$cDNA_sample[replicate_condition_lookup$condition %in% control_conditions]
-if (length(control_replicates) == 0) {
-    control_replicates <- cdna_sample[1]
-}
-
-# Use only the control replicates with the lowest pDNA bleed-through as the banana anchor,
-# so every sample (including the remaining controls) is corrected against bias-free controls.
-control_bleedthrough <- bleed_through_slope_df %>%
-    filter(sample %in% control_replicates) %>%
+# Banana anchors are chosen per comparison: the replicates with the lowest pDNA bleed-through
+# within the reference condition of that comparison (per plate), so every contrast is corrected
+# against its own reference. A condition belongs to the first comparison that lists it as contrast.
+# Without a comparisons file, all control-like conditions are pooled into a single group instead.
+bleedthrough_by_replicate <- bleed_through_slope_df %>%
     distinct(sample, slope) %>%
-    arrange(slope)
-global_banana_anchors <- select_banana_anchors(control_bleedthrough)
+    rename(cDNA_sample = sample)
+present_conditions <- unique(replicate_condition_lookup$condition)
+group_refs <- list()
+member_of <- character(0)
+if (!is.null(opt$comparisons) && nzchar(opt$comparisons) && file.exists(opt$comparisons)) {
+    comparison_rows <- lapply(strsplit(readLines(opt$comparisons, warn = FALSE), "\t"), function(x) {
+        x <- trimws(x)
+        x[nzchar(x)]
+    })
+    comparison_rows <- Filter(function(x) length(x) >= 2 && x[1] %in% present_conditions, comparison_rows)
+    for (row in comparison_rows) {
+        group_refs[[row[1]]] <- row[1]
+        member_of[row[1]] <- row[1]
+    }
+    for (row in comparison_rows) {
+        for (contrast in intersect(row[-1], present_conditions)) {
+            if (!contrast %in% names(member_of)) member_of[contrast] <- row[1]
+        }
+    }
+} else {
+    control_pattern <- "control|ctrl|dmso|no[_ .-]?treat|untreat|vehicle"
+    pooled <- present_conditions[str_detect(str_to_lower(present_conditions), control_pattern)]
+    if (length(pooled) == 0) pooled <- present_conditions[1]
+    group_refs[["controls"]] <- pooled
+    member_of <- setNames(rep("controls", length(present_conditions)), present_conditions)
+}
 
-control_bleedthrough$plate <- plate_key(control_bleedthrough$sample)
-banana_anchors_by_plate <- lapply(
-    split(control_bleedthrough, control_bleedthrough$plate),
-    select_banana_anchors
-)
-banana_reference_replicates <- unique(unlist(banana_anchors_by_plate))
-if (length(banana_reference_replicates) == 0) {
-    banana_reference_replicates <- global_banana_anchors
+banana_anchor_table <- bind_rows(lapply(names(group_refs), function(g) {
+    replicate_condition_lookup %>%
+        filter(condition %in% group_refs[[g]]) %>%
+        inner_join(bleedthrough_by_replicate, by = "cDNA_sample") %>%
+        mutate(group = g, plate = plate_key(cDNA_sample)) %>%
+        arrange(slope)
+}))
+banana_anchors <- list()
+for (g in names(group_refs)) {
+    group_df <- banana_anchor_table %>% filter(group == g)
+    banana_anchors[[g]] <- lapply(split(group_df, group_df$plate), function(d) select_banana_anchors(d %>% rename(sample = cDNA_sample)))
+    for (key in names(banana_anchors[[g]])) {
+        message("==== Banana reference for ", g, " (", paste(group_refs[[g]], collapse = " + "),
+                ", lowest bleed-through, plate ", key, "): ", paste(banana_anchors[[g]][[key]], collapse = ", "))
+    }
 }
-anchors_for_plate <- function(key) {
-    anchors <- banana_anchors_by_plate[[key]]
-    if (is.null(anchors) || length(anchors) == 0) global_banana_anchors else anchors
+anchors_for_plate <- function(group, key) {
+    anchors <- banana_anchors[[group]][[key]]
+    if (is.null(anchors) || length(anchors) == 0) unique(unlist(banana_anchors[[group]])) else anchors
 }
-for (key in names(banana_anchors_by_plate)) {
-    message("==== Banana reference (", control_condition, " replicates with lowest bleed-through, plate ", key, "): ",
-            paste(banana_anchors_by_plate[[key]], collapse = ", "))
-}
+banana_reference_replicates <- unique(unlist(banana_anchors))
 write.table(
-    control_bleedthrough %>%
-        transmute(replicate = sample, plate, bleedthrough_slope = slope, used_as_reference = sample %in% banana_reference_replicates),
+    banana_anchor_table %>%
+        transmute(
+            replicate = cDNA_sample, condition, plate,
+            bleedthrough_slope = slope,
+            used_as_reference = cDNA_sample %in% banana_reference_replicates
+        ),
     file = file.path(opt$activity_basedir, "banana_reference_samples.tsv"),
     sep = "\t", quote = FALSE, row.names = FALSE
 )
-control_label <- paste0(control_condition, " low-bleedthrough reference (n=", length(banana_reference_replicates), ")")
+control_label <- "reference-condition low-bleedthrough anchors (per comparison)"
 
 build_barcode_control_comparison <- function(barcode_activity_df, control_replicates) {
     barcode_activity_df %>%
@@ -1654,10 +1907,14 @@ baseline_barcode_activity_df <- summarise_barcode_activity(baseline_activity_df)
     left_join(replicate_condition_lookup, by = "cDNA_sample")
 
 build_plate_control_comparison <- function(barcode_activity_df) {
-    keys <- plate_key(barcode_activity_df$cDNA_sample)
-    bind_rows(lapply(unique(keys), function(key) {
-        build_barcode_control_comparison(barcode_activity_df[keys == key, ], anchors_for_plate(key)) %>%
-            mutate(plate = key)
+    bind_rows(lapply(names(group_refs), function(g) {
+        group_df <- barcode_activity_df[barcode_activity_df$condition %in% names(member_of)[member_of == g], ]
+        if (nrow(group_df) == 0) return(NULL)
+        keys <- plate_key(group_df$cDNA_sample)
+        bind_rows(lapply(unique(keys), function(key) {
+            build_barcode_control_comparison(group_df[keys == key, ], anchors_for_plate(g, key)) %>%
+                mutate(plate = key)
+        }))
     }))
 }
 barcode_control_comparison_df <- build_plate_control_comparison(barcode_activity_df)
@@ -1817,7 +2074,7 @@ invisible(dev.off())
 control_residual_correlation_stats <-
     barcode_control_comparison_df %>%
     filter(is.finite(control_log2_mean_RPM), is.finite(residual)) %>%
-    group_by(comparison) %>%
+    group_by(cDNA_sample) %>%
     group_modify(~ {
         this_df <- .x
         n_points <- nrow(this_df)
@@ -1960,17 +2217,14 @@ invisible(dev.off())
 
 message("==== Plotting residuals vs control with correlation test")
 pdf(file.path(opt$plots_basedir, "control_barcode_residuals_with_correlation_test.pdf"), width = 16, height = 16)
-for (page_idx in seq_along(barcode_control_pages)) {
-    page_comparisons <- barcode_control_pages[[page_idx]]
+for (page_idx in seq_along(barcode_control_replicate_pages)) {
+    page_replicates <- barcode_control_replicate_pages[[page_idx]]
     page_df <- barcode_control_comparison_df %>%
-        filter(comparison %in% page_comparisons) %>%
-        mutate(comparison = factor(comparison, levels = page_comparisons))
-    page_labels <- barcode_control_labels %>%
-        filter(comparison %in% page_comparisons) %>%
-        mutate(comparison = factor(comparison, levels = page_comparisons))
+        filter(cDNA_sample %in% page_replicates) %>%
+        mutate(cDNA_sample = factor(cDNA_sample, levels = page_replicates))
     page_stats <- control_residual_correlation_stats %>%
-        filter(comparison %in% page_comparisons) %>%
-        mutate(comparison = factor(comparison, levels = page_comparisons))
+        filter(cDNA_sample %in% page_replicates) %>%
+        mutate(cDNA_sample = factor(cDNA_sample, levels = page_replicates))
 
     if (nrow(page_df) == 0) {
         next
@@ -1989,9 +2243,9 @@ for (page_idx in seq_along(barcode_control_pages)) {
             size = 2.9,
             lineheight = 0.95
         ) +
-        facet_wrap(~comparison, ncol = 5) +
+        facet_wrap(~cDNA_sample, ncol = 5) +
         theme_pubr(border = T) +
-        ggtitle(paste0("Residual barcode activity vs ", control_label, " (page ", page_idx, "/", length(barcode_control_pages), ")")) +
+        ggtitle(paste0("Residual barcode activity vs ", control_label, " (page ", page_idx, "/", length(barcode_control_replicate_pages), ")")) +
         xlab(paste0(control_label, " barcode activity (log2 mean RPM)")) +
         ylab("Residual activity (sample - control, log2 mean RPM)") +
         theme(
@@ -2040,12 +2294,13 @@ for (this_condition in replicate_condition_lookup$condition %>% unique()) {
             cDNA_sample = cDNA_sample
         ) %>%
         pivot_wider(names_from = cDNA_sample, values_from = activity_RPM) %>%
+        mutate(tf_label = tf) %>%
         select(-barcode, -tf, -promoter) %>%
-        # print()
-        # Plot correlations
+        # Plot correlations (tf_label is only used to label outliers)
         ggpairs(
+            columns = replicates_of_this_sample[replicates_of_this_sample %in% colnames(.)],
             upper = list(continuous = upper_diag_plot),
-            lower = list(continuous = lower_diag_plot),
+            lower = list(continuous = lower_diag_plot_labeled),
             diag = list(continuous = diag_plot)
         ) +
         ggtitle(paste("Replicate correlation of ", this_condition)) +

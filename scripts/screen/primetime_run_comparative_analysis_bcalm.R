@@ -54,8 +54,7 @@ option_list <- list(
         make_option(c("--num_replicates_contrast"), type = "integer", default = 1, help = "Number of replicates for the contrast condition"),
         make_option(c("--num_replicates_reference"), type = "integer", default = 1, help = "Number of replicates for the reference condition"),
         make_option(c("--single_model"), type = "logical", default = FALSE, help = "Whether to make a single model for all the TFs or not"),
-        make_option(c("--normalize"), type = "logical", default = TRUE, help = "Whether to normalize activities by promoter-specific negative controls"),
-        make_option(c("--random_norm_method"), type = "character", default = "median", help = "RANDOM-reporter normalization: 'median' (per-promoter median) or 'shrunk' (precision-weighted pooled shift with shrunken promoter deviations)"),
+        make_option(c("--normalize"), type = "logical", default = TRUE, help = "Whether to normalize counts per promoter and replicate using the RANDOM reporters (count-level)"),
         make_option(c("--shrinkage"), type = "logical", default = FALSE, help = "Add empirical-Bayes shrunken logFC (computed after BCalm from logFC and its SE) to the output and show shrunk and unshrunk values in the plots"),
         make_option(c("--plate_ids"), type = "character", default = "", help = "Comma-separated sample plate IDs (PLATES_FILE) used to assign replicates to plates for the per-plate banana anchors"),
         make_option(c("--banana_correction"), type = "logical", default = TRUE, help = "Whether to apply the banana-shaped bias correction to contrast vs reference barcode counts"),
@@ -108,6 +107,84 @@ split_replicate_bc_colname <- function(col_names) {
         bc_suffix <- sub("^.*_(bc[0-9]+)$", "\\1", col_names)
         replicate_name <- sub("_bc[0-9]+$", "", col_names)
         data.frame(col_name = col_names, replicate = replicate_name, bc = bc_suffix, stringsAsFactors = FALSE)
+}
+
+# Normalize counts within each promoter and replicate using that promoter's
+# negative-control (RANDOM) reporters as the reference.
+normalize_counts_by_random <- function(cdna_matrix, pdna_matrix, negative_control_flag, promoter_vector, target = 1e7) {
+        if (!identical(dim(cdna_matrix), dim(pdna_matrix)) ||
+            !identical(rownames(cdna_matrix), rownames(pdna_matrix))) {
+                stop("cDNA and pDNA matrices must have matching dimensions and row order")
+        }
+        if (length(negative_control_flag) != nrow(cdna_matrix) ||
+            length(promoter_vector) != nrow(cdna_matrix)) {
+                stop("Promoter and negative-control metadata must match the count matrix rows")
+        }
+        if (length(target) != 1 || !is.finite(target) || target <= 0) {
+                stop("Normalization target must be a single finite positive number")
+        }
+
+        promoter_values <- as.character(promoter_vector)
+        if (anyNA(promoter_values) || any(!nzchar(promoter_values))) {
+                stop("Promoter metadata contains missing or empty values")
+        }
+        if (anyNA(negative_control_flag)) {
+                stop("Negative-control metadata contains missing values")
+        }
+        if (is.logical(negative_control_flag)) {
+                is_random <- negative_control_flag
+        } else {
+                is_random <- toupper(trimws(as.character(negative_control_flag))) %in% c("TRUE", "T", "1", "YES", "Y")
+        }
+
+        normalize_matrix <- function(count_matrix, matrix_name) {
+                normalized <- count_matrix * 1.0
+                warnings <- character(0)
+
+                for (promoter in unique(promoter_values)) {
+                        promoter_rows <- which(promoter_values == promoter)
+                        random_rows <- promoter_rows[is_random[promoter_rows]]
+                        if (length(random_rows) == 0) {
+                                warnings <- c(warnings, paste0("no RANDOM reporters for promoter '", promoter, "'"))
+                                next
+                        }
+
+                        random_sums <- colSums(count_matrix[random_rows, , drop = FALSE], na.rm = TRUE)
+                        valid_sums <- is.finite(random_sums) & random_sums > 0
+                        scale_factors <- rep(1, ncol(count_matrix))
+                        scale_factors[valid_sums] <- target / random_sums[valid_sums]
+                        normalized[promoter_rows, ] <- sweep(
+                                count_matrix[promoter_rows, , drop = FALSE],
+                                2,
+                                scale_factors,
+                                FUN = "*"
+                        )
+
+                        if (any(!valid_sums)) {
+                                warnings <- c(
+                                        warnings,
+                                        paste0(
+                                                "zero or non-finite RANDOM count sum for promoter '", promoter,
+                                                "' in column(s): ",
+                                                paste(colnames(count_matrix)[!valid_sums], collapse = ", ")
+                                        )
+                                )
+                        }
+                }
+
+                if (length(warnings) > 0) {
+                        warning(
+                                paste0("Count-level normalization for ", matrix_name, " skipped scaling where needed: ",
+                                       paste(warnings, collapse = "; "))
+                        )
+                }
+                normalized
+        }
+
+        list(
+                cdna = normalize_matrix(cdna_matrix, "cDNA"),
+                pdna = normalize_matrix(pdna_matrix, "pDNA")
+        )
 }
 
 # Loess-corrects contrast-condition barcode counts toward the reference condition,
@@ -237,137 +314,43 @@ correct_banana_against_anchor <- function(cdna_count_matrix, pdna_count_matrix, 
         cdna_count_matrix
 }
 
-# Diagnostic MA plot (activity level), before vs after banana correction.
-plot_banana_diagnostic_activity <- function(cdna_matrix_before, cdna_matrix_after, pdna_matrix, ref_replicates, contrast_replicates, title_suffix, pseudocount = 1) {
+# Per-replicate MA data (activity level) before vs after banana correction, written to a TSV that
+# primetime_get_banana_qc.R turns into one QC page per replicate.
+# A = mean log2 activity of the anchor/reference replicates, M = replicate - A.
+banana_replicate_ma_df <- function(cdna_matrix_before, cdna_matrix_after, pdna_matrix, anchor_replicates, replicate_condition, pseudocount = 1) {
         col_info <- split_replicate_bc_colname(colnames(cdna_matrix_before))
-        ref_cols <- col_info$col_name[col_info$replicate %in% ref_replicates]
-        contrast_cols <- col_info$col_name[col_info$replicate %in% contrast_replicates]
-        if (length(ref_cols) == 0 || length(contrast_cols) == 0) return(invisible(NULL))
+        anchor_cols <- col_info$col_name[col_info$replicate %in% anchor_replicates]
+        replicates <- names(replicate_condition)
+        if (length(anchor_cols) == 0 || length(replicates) == 0) return(data.frame())
 
         pdna_rpm <- sweep(pdna_matrix, 2, colSums(pdna_matrix), FUN = function(x, s) x / s * 1e6)
 
-        make_MA_df <- function(cdna_matrix) {
+        make_ma_df <- function(cdna_matrix, stage) {
                 cdna_rpm <- sweep(cdna_matrix, 2, colSums(cdna_matrix, na.rm = TRUE), FUN = function(x, s) x / s * 1e6)
                 log2_activity <- log2((cdna_rpm + pseudocount) / (pdna_rpm + pseudocount))
                 long_df <- as.data.frame(log2_activity) %>%
                         mutate(tf = rownames(cdna_matrix)) %>%
                         pivot_longer(-tf, names_to = "col_name", values_to = "log2_activity") %>%
                         left_join(col_info, by = "col_name")
-                reference_means <- long_df %>% filter(col_name %in% ref_cols) %>% group_by(tf, bc) %>% summarise(reference_mean = mean(log2_activity, na.rm = TRUE), .groups = "drop")
-                contrast_means <- long_df %>% filter(col_name %in% contrast_cols) %>% group_by(tf, bc) %>% summarise(contrast_mean = mean(log2_activity, na.rm = TRUE), .groups = "drop")
-                reference_means %>% inner_join(contrast_means, by = c("tf", "bc")) %>% mutate(A = reference_mean, M = contrast_mean - reference_mean)
-        }
-
-        before_df <- make_MA_df(cdna_matrix_before) %>% mutate(stage = "Before correction")
-        after_df <- make_MA_df(cdna_matrix_after) %>% mutate(stage = "After correction")
-        combined_df <- bind_rows(before_df, after_df) %>% filter(is.finite(A), is.finite(M))
-
-        if (nrow(combined_df) == 0) return(invisible(NULL))
-
-        print(
-                ggplot(combined_df, aes(x = A, y = M)) +
-                        geom_point(alpha = 0.15, size = 0.5) +
-                        geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-                        geom_smooth(method = "loess", se = FALSE, color = "#2c7fb8", span = 0.75) +
-                        facet_wrap(~stage) +
-                        ggpubr::theme_pubr(border = TRUE) +
-                        labs(
-                                title = paste("Banana correction diagnostic (activity level) -", title_suffix),
-                                x = "Reference mean log2 activity",
-                                y = "M (contrast - reference, log2 activity)"
-                        ) +
-                        theme(text = element_text(size = 14))
-        )
-
-        # Loess can look flat overall while still hiding a residual bias confined to
-        # one end of the activity range; bin by reference-activity tercile so a
-        # low-activity-specific shift shows up numerically instead of visually.
-        tercile_df <- combined_df %>%
-                mutate(
-                        activity_tercile = cut(
-                                A,
-                                breaks = quantile(A, probs = seq(0, 1, 1 / 3), na.rm = TRUE),
-                                include.lowest = TRUE,
-                                labels = c("Low reference activity", "Mid reference activity", "High reference activity")
-                        ),
-                        stage = factor(stage, levels = c("Before correction", "After correction"))
-                ) %>%
-                filter(!is.na(activity_tercile))
-
-        if (nrow(tercile_df) > 0) {
-                print(
-                        ggplot(tercile_df, aes(x = activity_tercile, y = M)) +
-                                geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-                                geom_boxplot(outlier.alpha = 0.2) +
-                                stat_summary(fun = median, geom = "point", shape = 23, fill = "white", color = "black", size = 2.5) +
-                                facet_wrap(~stage) +
-                                ggpubr::theme_pubr(border = TRUE) +
-                                labs(
-                                        title = paste("Banana correction residual by activity tercile -", title_suffix),
-                                        x = NULL,
-                                        y = "M (contrast - reference, log2 activity)"
-                                ) +
-                                theme(text = element_text(size = 14), axis.text.x = element_text(angle = 20, hjust = 1))
-                )
-        }
-}
-
-# Replicates mpra::normalize_counts()+compute_logratio() bit-for-bit (library-size
-# scaling to 1e7 AND rounding to nearest integer before the pseudocount/log2), so we
-# can tell whether the banana bias mpralm reports is reintroduced by that rounding
-# step rather than by the model fit/weighting.
-plot_banana_diagnostic_mpra_scale <- function(cdna_matrix_before, cdna_matrix_after, pdna_matrix, ref_replicates, contrast_replicates, title_suffix) {
-        col_info <- split_replicate_bc_colname(colnames(cdna_matrix_before))
-        ref_cols <- col_info$col_name[col_info$replicate %in% ref_replicates]
-        contrast_cols <- col_info$col_name[col_info$replicate %in% contrast_replicates]
-        if (length(ref_cols) == 0 || length(contrast_cols) == 0) return(invisible(NULL))
-
-        dna_norm <- round(sweep(pdna_matrix, 2, colSums(pdna_matrix), FUN = "/") * 1e7)
-
-        make_mpra_scale_df <- function(cdna_matrix) {
-                rna_norm <- round(sweep(cdna_matrix, 2, colSums(cdna_matrix, na.rm = TRUE), FUN = "/") * 1e7)
-                logr <- log2(rna_norm + 1) - log2(dna_norm + 1)
-
-                long_df <- as.data.frame(logr) %>%
-                        mutate(tf = rownames(cdna_matrix)) %>%
-                        pivot_longer(-tf, names_to = "col_name", values_to = "logr") %>%
-                        left_join(col_info, by = "col_name")
-
-                reference_means <- long_df %>%
-                        filter(col_name %in% ref_cols) %>%
+                anchor_means <- long_df %>%
+                        filter(col_name %in% anchor_cols) %>%
                         group_by(tf, bc) %>%
-                        summarise(reference_mean = mean(logr, na.rm = TRUE), .groups = "drop")
-
-                contrast_means <- long_df %>%
-                        filter(col_name %in% contrast_cols) %>%
-                        group_by(tf, bc) %>%
-                        summarise(contrast_mean = mean(logr, na.rm = TRUE), .groups = "drop")
-
-                reference_means %>%
-                        inner_join(contrast_means, by = c("tf", "bc")) %>%
-                        mutate(A = reference_mean, M = contrast_mean - reference_mean)
+                        summarise(A = mean(log2_activity, na.rm = TRUE), .groups = "drop")
+                long_df %>%
+                        filter(replicate %in% replicates) %>%
+                        group_by(replicate, tf, bc) %>%
+                        summarise(activity = mean(log2_activity, na.rm = TRUE), .groups = "drop") %>%
+                        inner_join(anchor_means, by = c("tf", "bc")) %>%
+                        mutate(M = activity - A, stage = stage) %>%
+                        select(replicate, tf, bc, A, M, stage)
         }
 
-        before_df <- make_mpra_scale_df(cdna_matrix_before) %>% mutate(stage = "Before correction")
-        after_df <- make_mpra_scale_df(cdna_matrix_after) %>% mutate(stage = "After correction")
-        combined_df <- bind_rows(before_df, after_df) %>% filter(is.finite(A), is.finite(M))
-
-        if (nrow(combined_df) == 0) return(invisible(NULL))
-
-        print(
-                ggplot(combined_df, aes(x = A, y = M)) +
-                        geom_point(alpha = 0.15, size = 0.5) +
-                        geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-                        geom_smooth(method = "loess", se = FALSE, color = "#2c7fb8", span = 0.75) +
-                        facet_wrap(~stage) +
-                        ggpubr::theme_pubr(border = TRUE) +
-                        labs(
-                                title = paste("Banana diagnostic replicating mpralm's own normalize+log-ratio math -", title_suffix),
-                                x = "Reference mean log-ratio (mpralm scale, rounded)",
-                                y = "M (contrast - reference, mpralm-scale log-ratio)"
-                        ) +
-                        theme(text = element_text(size = 14))
-        )
+        bind_rows(
+                make_ma_df(cdna_matrix_before, "Before correction"),
+                make_ma_df(cdna_matrix_after, "After correction")
+        ) %>%
+                filter(is.finite(A), is.finite(M)) %>%
+                mutate(condition = unname(replicate_condition[replicate]))
 }
 
 plot_bcalm_normalization_diagnostic <- function(results_before, results_after, reference_condition, contrast_condition, output_file) {
@@ -531,48 +514,7 @@ name_of_the_pdna_replicate <- colnames(pdna) %>% setdiff(c("barcode", "negative_
 contrast_condition <- opt$contrast_condition
 reference_condition <- opt$reference_condition
 normalize_counts <- isTRUE(opt$normalize)
-random_norm_method <- tolower(opt$random_norm_method)
-if (!random_norm_method %in% c("median", "shrunk")) {
-        stop("--random_norm_method must be 'median' or 'shrunk'")
-}
 
-weighted_median <- function(x, w) {
-        ok <- is.finite(x) & is.finite(w) & w > 0
-        x <- x[ok]
-        w <- w[ok]
-        if (length(x) == 0) return(NA_real_)
-        o <- order(x)
-        x <- x[o]
-        cw <- cumsum(w[o]) / sum(w)
-        x[which(cw >= 0.5)[1]]
-}
-
-# Per-promoter shift of the contrast vs. reference estimated from RANDOM reporters.
-# Reporters are precision-weighted (se^2 plus the reporter-to-reporter excess variance), a
-# pooled shift is taken over all promoters, and each promoter's deviation from the pooled
-# shift is shrunk by tau^2 / (tau^2 + se_p^2), tau^2 being the between-promoter variance.
-estimate_random_shifts <- function(y, se, promoter) {
-        se2 <- ifelse(is.finite(se) & se > 0, se^2, NA_real_)
-        se2[is.na(se2)] <- median(se2, na.rm = TRUE)
-        if (all(is.na(se2))) se2[] <- 1
-        excess <- if (length(y) > 2) max(0, mad(y)^2 - mean(se2)) else 0
-        w <- 1 / (se2 + excess)
-        mu <- weighted_median(y, w)
-        per_promoter <- lapply(split(seq_along(y), promoter), function(idx) {
-                data.frame(
-                        median = weighted_median(y[idx], w[idx]),
-                        var = (pi / 2) / sum(w[idx])
-                )
-        })
-        per_promoter <- do.call(rbind, per_promoter)
-        dev <- per_promoter$median - mu
-        tau2 <- if (nrow(per_promoter) >= 2) max(0, mean(dev^2 - per_promoter$var)) else 0
-        data.frame(
-                promoter = rownames(per_promoter),
-                delta = mu + dev * tau2 / (tau2 + per_promoter$var),
-                row.names = NULL
-        ) %>% mutate(pooled = mu, tau = sqrt(tau2))
-}
 # Adaptive-shrinkage-style empirical Bayes (ashr is not installed): zero-centred mixture of normals
 # prior learned from the observed logFC and their standard errors; returns posterior mean/sd.
 shrink_logfc <- function(beta, se, grid_mult = c(0, 0.25, 0.5, 1, 2, 4, 8, 16), n_iter = 500) {
@@ -628,7 +570,9 @@ if (length(contrast_replicates) == 0) {
 # are loaded as extra columns so they can serve as reference, then dropped before modelling.
 banana_anchor_replicates <- character(0)
 if (banana_correction && !is.null(opt$banana_reference_file) && file.exists(opt$banana_reference_file)) {
-        banana_anchor_replicates <- as.character(read.table(opt$banana_reference_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)$replicate)
+        # Anchors are chosen per comparison: only the flagged replicates of this comparison's reference condition
+        banana_reference_df <- read.table(opt$banana_reference_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+        banana_anchor_replicates <- as.character(banana_reference_df$replicate[banana_reference_df$used_as_reference & banana_reference_df$replicate %in% ref_replicates])
 }
 extra_anchor_replicates <- character(0)
 extra_anchor_replicates <- setdiff(banana_anchor_replicates, c(ref_replicates, contrast_replicates))
@@ -670,9 +614,12 @@ if (length(ref_replicates) == 0 || length(contrast_replicates) == 0) {
         for (d in c("volcano_plots", "lollipop_plots", "circular_lollipop_plots")) {
                 pdf(file.path(opt$plot_output, d, paste0(nm, ".pdf")), width = 6, height = 3)
                 plot.new()
-                text(0.5, 0.5, paste(nm, "\nno replicates passed the read-count filter"))
+                text(0.5, 0.5, paste(nm, "\nno replicates passed the replicate QC filters"))
                 invisible(dev.off())
         }
+        banana_qc_empty <- file.path(opt$output, "banana_qc", paste0(nm, ".tsv"))
+        dir.create(dirname(banana_qc_empty), showWarnings = FALSE, recursive = TRUE)
+        file.create(banana_qc_empty)
         quit(status = 0)
 }
 banana_anchor_replicates <- intersect(banana_anchor_replicates, c(ref_replicates, contrast_replicates, extra_anchor_replicates))
@@ -716,7 +663,9 @@ dir.create(file.path(opt$plot_output, "volcano_plots"), showWarnings = FALSE, re
 dir.create(file.path(opt$plot_output, "lollipop_plots"), showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path(opt$plot_output, "circular_lollipop_plots"), showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path(opt$plot_output, "output_data"), showWarnings = FALSE, recursive = TRUE)
-dir.create(file.path(opt$plot_output, "banana_diagnostics"), showWarnings = FALSE, recursive = TRUE)
+banana_qc_file <- file.path(opt$output, "banana_qc", sub("\\.pdf$", ".tsv", output_pdf_name))
+dir.create(dirname(banana_qc_file), showWarnings = FALSE, recursive = TRUE)
+file.create(banana_qc_file)
 
 tf_function_path <- find_existing_path(c(
         if (!is.na(project_root)) file.path(project_root, "misc", "tf_functions.tsv") else NA_character_,
@@ -936,10 +885,16 @@ if (banana_correction) {
                 )
         }
 
-        pdf(file.path(opt$plot_output, "banana_diagnostics", output_pdf_name), width = 12, height = 6)
-        plot_banana_diagnostic_activity(this_cdna_matrix_precorrection, this_cdna_matrix, this_pdna_matrix, diag_ref_replicates, contrast_replicates, "all promoters")
-        plot_banana_diagnostic_mpra_scale(this_cdna_matrix_precorrection, this_cdna_matrix, this_pdna_matrix, diag_ref_replicates, contrast_replicates, "all promoters")
-        invisible(dev.off())
+        # Replicates that were corrected (everything except the anchors) with their condition
+        banana_qc_replicates <- setdiff(c(ref_replicates, contrast_replicates), diag_ref_replicates)
+        banana_qc_condition <- setNames(
+                ifelse(banana_qc_replicates %in% contrast_replicates, contrast_condition, reference_condition),
+                banana_qc_replicates
+        )
+        write.table(
+                banana_replicate_ma_df(this_cdna_matrix_precorrection, this_cdna_matrix, this_pdna_matrix, diag_ref_replicates, banana_qc_condition),
+                banana_qc_file, sep = "\t", row.names = FALSE, quote = FALSE
+        )
 
         print("This cDNA matrix (after banana correction)")
         print(head(this_cdna_matrix))
@@ -953,6 +908,24 @@ if (length(extra_anchor_replicates) > 0) {
         this_pdna_matrix <- this_pdna_matrix[, keep_cols, drop = FALSE]
         this_cdna_baseline_matrix <- this_cdna_baseline_matrix[, keep_cols, drop = FALSE]
         this_cdna_matrix_precorrection <- this_cdna_matrix_precorrection[, keep_cols, drop = FALSE]
+}
+
+# Count-level normalization: scale each promoter/column using its RANDOM reporter sum.
+# This is applied BEFORE the model, so variance estimates and p-values see the corrected data.
+if (normalize_counts) {
+        message("---- Normalizing counts at count level by per-promoter RANDOM reporter sums")
+        norm_result <- normalize_counts_by_random(
+                this_cdna_matrix,
+                this_pdna_matrix,
+                this_tmp_parsed_pdna$negative_control,
+                this_tmp_parsed_pdna$promoter,
+                target = 1e7
+        )
+        this_cdna_matrix <- norm_result$cdna
+        this_pdna_matrix <- norm_result$pdna
+        
+        print("This cDNA matrix (after count-level normalization)")
+        print(head(this_cdna_matrix))
 }
 
 corrected_matrix_long <- as.data.frame(this_cdna_matrix, check.names = FALSE) %>%
@@ -1013,11 +986,16 @@ colnames(design_bcalm) = c("intcpt", contrast_condition)
 print("Design BCalm")
 print(design_bcalm)
 
+bcalm_normalize <- !normalize_counts
+if (!bcalm_normalize) {
+        message("---- Disabling BCalm global library-size normalization; per-promoter count-level normalization is already applied")
+}
+
 mpralm_fit_var <- mpralm(
         object = BcVariantMPRASet,
         design = design_bcalm,
         aggregate = "none",
-        normalize = TRUE,
+        normalize = bcalm_normalize,
         model_type = "indep_groups",
         plot = FALSE
 )
@@ -1047,72 +1025,8 @@ results_bcalm =
         mutate(!!contrast_condition := logFC + !!sym(reference_condition))
 
 all_results = results_bcalm
-all_results_before_normalization <- all_results
 
-if (normalize_counts) {
-        message("==== Normalizing BCalm activities by per-promoter RANDOM reporter medians")
-        all_results <- all_results %>% left_join(tf_promoter_map, by = "tf")
-
-        random_mask <- grepl("RANDOM", all_results$tf, ignore.case = TRUE)
-        global_median_reference <- median(all_results[[reference_condition]][random_mask], na.rm = TRUE)
-        global_median_contrast <- median(all_results[[contrast_condition]][random_mask], na.rm = TRUE)
-
-        promoter_medians <- all_results %>%
-                filter(random_mask) %>%
-                group_by(promoter) %>%
-                summarise(
-                        median_reference = median(!!sym(reference_condition), na.rm = TRUE),
-                        median_contrast = median(!!sym(contrast_condition), na.rm = TRUE),
-                        .groups = "drop"
-                ) %>%
-                filter(is.finite(median_reference), is.finite(median_contrast))
-
-        if (nrow(promoter_medians) == 0 || !is.finite(global_median_reference) || !is.finite(global_median_contrast)) {
-                warning("No finite RANDOM reporter activities found; leaving BCalm activities unnormalized")
-                all_results <- all_results %>% mutate(old_logFC = logFC) %>% select(-promoter)
-        } else {
-                promoters_missing_random <- setdiff(unique(all_results$promoter), promoter_medians$promoter)
-                if (length(promoters_missing_random) > 0) {
-                        warning(paste0(
-                                "No RANDOM reporters found for promoter(s): ",
-                                paste(promoters_missing_random, collapse = ", "),
-                                "; falling back to global RANDOM reporter median for those"
-                        ))
-                }
-
-                if (random_norm_method == "shrunk") {
-                        random_rows <- all_results %>% filter(random_mask, is.finite(logFC))
-                        shift_tbl <- estimate_random_shifts(random_rows$logFC, unname(reporter_se[random_rows$tf]), random_rows$promoter)
-                        message("RANDOM shift: pooled = ", round(shift_tbl$pooled[1], 3), ", between-promoter tau = ", round(shift_tbl$tau[1], 3))
-                        all_results <- all_results %>%
-                                left_join(promoter_medians, by = "promoter") %>%
-                                left_join(shift_tbl %>% select(promoter, delta), by = "promoter") %>%
-                                mutate(
-                                        median_reference = ifelse(is.finite(median_reference), median_reference, global_median_reference),
-                                        delta = ifelse(is.finite(delta), delta, shift_tbl$pooled[1]),
-                                        old_logFC = logFC,
-                                        !!reference_condition := !!sym(reference_condition) - median_reference,
-                                        logFC = old_logFC - delta,
-                                        !!contrast_condition := !!sym(reference_condition) + logFC
-                                ) %>%
-                                select(-promoter, -median_reference, -median_contrast, -delta)
-                } else {
-                        all_results <- all_results %>%
-                                left_join(promoter_medians, by = "promoter") %>%
-                                mutate(
-                                        median_reference = ifelse(is.finite(median_reference), median_reference, global_median_reference),
-                                        median_contrast = ifelse(is.finite(median_contrast), median_contrast, global_median_contrast),
-                                        old_logFC = logFC,
-                                        !!reference_condition := !!sym(reference_condition) - median_reference,
-                                        !!contrast_condition := !!sym(contrast_condition) - median_contrast,
-                                        logFC = !!sym(contrast_condition) - !!sym(reference_condition)
-                                ) %>%
-                                select(-promoter, -median_reference, -median_contrast)
-                }
-        }
-} else {
-        all_results <- all_results %>% mutate(old_logFC = logFC)
-}
+all_results <- all_results %>% mutate(old_logFC = logFC)
 
 # Correcting the p-values for multiple testing
 message("==== Correcting p-values")
@@ -1120,10 +1034,15 @@ all_results <- all_results %>%
         mutate(p_adjusted = p.adjust(P.Value, method = "BH"))
 
 if (normalize_counts) {
+        # For count-level normalization: p-values already reflect the corrected data,
+        # so we do not need a sign-agreement guard. Use the logFC directly.
+        message("---- Using count-level normalized results (p-values see corrected data)")
         all_results <- all_results %>%
                 mutate(
-                        sig = ifelse(old_logFC > 0 & logFC >= logfc_threshold & p_adjusted <= p_threshold, "Upregulated",
-                                ifelse(old_logFC < 0 & logFC <= -logfc_threshold & p_adjusted <= p_threshold, "Downregulated", "NS")
+                        sig = ifelse(p_adjusted <= p_threshold,
+                                ifelse(logFC >= logfc_threshold, "Upregulated", 
+                                       ifelse(logFC <= -logfc_threshold, "Downregulated", "NS")),
+                                "NS"
                         )
                 )
 } else {

@@ -16,22 +16,26 @@ OUTPUT_DIRECTORY: /DATA/shared/projects/TF_REPORTERS/prime_TF_reporters/E2951_in
 # ============================ Pipeline parameters =============================
 PVALUE_THRESHOLD: 0.01
 
-SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER: False
-
 NORMALIZE_COUNTS: True
+# Normalization is count-level: counts are scaled per promoter and replicate using the RANDOM reporters before BCalm
 
 # Set to False to skip the banana-shaped bias correction of contrast vs reference barcode counts
 BANANA_CORRECTION: True
-# Number of control (DMSO) replicates with the lowest pDNA bleed-through used as banana-correction reference
-# (all other samples, including remaining DMSO ones, are corrected against their mean). Use 0 for all controls.
+# Banana correction is done per comparison: the number of replicates of the reference condition with the
+# lowest pDNA bleed-through used as anchor (the others and the contrast are corrected against their mean).
+# Use 0 for all replicates of the reference condition.
 BANANA_REFERENCE_N: 3
 
-# Set to True to correct TF cDNA counts for sequencing-depth-dependent activity
-DEPTH_NORMALIZATION: False
+# Exclude cDNA replicates with fewer than this many reads (0 = keep all). Comparisons that lose all
+# replicates of a condition get empty outputs.
+MIN_READS_PER_REPLICATE: 0
 
-# Set to True to correct stable barcode-specific activity offsets per TF/promoter reporter
-BARCODE_OFFSET_CORRECTION: False
+# Exclude cDNA replicates above this pre-barcode-filter bleed-through fraction (0.5 = 50%); -1 disables.
+MAX_BLEEDTHROUGH: 0.5
 
+# Set to True to add empirical-Bayes shrunken logFC values after BCalm
+# (p-values and significance calls remain based on unshrunk logFC).
+SHRINKAGE: False
 
 
 # ==============================================================================

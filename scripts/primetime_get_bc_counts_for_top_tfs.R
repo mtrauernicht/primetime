@@ -25,6 +25,7 @@ suppressPackageStartupMessages({
 option_list <- list(
     make_option(c("--result"), type = "character", help = "Results file from PrimeTime"),
     make_option(c("--cdna"), type = "character", help = "cDNA counts file"),
+    make_option(c("--model_activity"), type = "character", default = NULL, help = "Optional per-barcode model activity after normalization"),
   make_option(c("--pdna"), type = "character", default = NA_character_, help = "pDNA counts file (optional; auto-detected if omitted)"),
     make_option(c("--output"), type = "character", help = "Output directory for the plots"),
     make_option(c("--design"), type = "character", help = "Design DF with sample names"),
@@ -55,6 +56,15 @@ if (is.na(pdna_path)) {
   stop("Could not find pDNA counts file. Pass --pdna explicitly or ensure tmp_primetime/activity/pDNA_counts.txt exists next to the output directory.")
 }
 
+# Comparisons without any replicate left (MIN_READS_PER_REPLICATE) have an empty result file
+if (!file.exists(opt$result) || file.info(opt$result)$size == 0) {
+  message("Empty result file; writing an empty plot")
+  pdf(opt$output, width = 6, height = 3)
+  plot.new()
+  text(0.5, 0.5, "No replicates passed the replicate QC filters")
+  invisible(dev.off())
+  quit(status = 0)
+}
 
 read.table(opt$result, header=T) %>% 
   as_tibble() %>%
@@ -71,13 +81,13 @@ read.table(opt$design, header=T) %>%
 # Read counts df
 cdna_df = 
   read.table(opt$cdna, 
-             header=T) %>% 
+             header=T, check.names=FALSE) %>% 
   as_tibble() %>%
   select(-any_of(c("negative_control", "promoter")))
 
 pdna_df = 
   read.table(pdna_path, 
-             header=T) %>% 
+             header=T, check.names=FALSE) %>% 
   as_tibble() %>%
   select(any_of(c("barcode")), where(is.numeric))
 
@@ -102,7 +112,14 @@ pdna_mean <- pdna_df %>%
   group_by(barcode) %>%
   summarize(pDNA_mean_RPM = mean(pDNA_mean_RPM, na.rm = TRUE), .groups = 'drop')
 
-df = 
+df =
+if (!is.null(opt$model_activity)) {
+  model_df <- read.table(opt$model_activity, header = TRUE, sep = "\t", check.names = FALSE)
+  if (!all(c("tf", "replicate", "read_count_log2") %in% names(model_df))) {
+    stop("Model barcode activity must contain tf, replicate and read_count_log2 columns")
+  }
+  as_tibble(model_df)
+} else {
   melt(cdna_df, id.vars=c('tf', 'barcode'), variable.name = 'replicate', value.name='cDNA_count') %>% as_tibble() %>%
   mutate(cDNA_count = as.numeric(cDNA_count)) %>%
   group_by(replicate) %>%
@@ -110,6 +127,7 @@ df =
   ungroup() %>%
   left_join(pdna_mean, by = 'barcode') %>%
   mutate(read_count_log2 = log2(cDNA_RPM / pDNA_mean_RPM))
+}
 
 inner_join(df, design_df, by = 'replicate') %>%
   inner_join(top10_tfs, by = 'tf') %>%
@@ -123,13 +141,25 @@ inner_join(df, design_df, by = 'replicate') %>%
   
 
 pdf(opt$output, width=20, height=20)
+if (nrow(plot_df) == 0) {
+  message("No barcode activity matched the results and design; writing an empty plot")
+  plot.new()
+  text(0.5, 0.5, "No barcode activity matched the results and design")
+  invisible(dev.off())
+  quit(status = 0)
+}
 plot_df %>%
 # plot
   ggplot(aes(x=replicate, y=read_count_log2)) +
   geom_point(aes(color=treatment_col)) +
   scale_color_manual(values = c("Control condition" = "#000000", "NS" = "grey", "Downregulated" = "#6495ed", "Upregulated" = "#f37f80")) +
   facet_wrap(~factor(tf_lbl, levels(plot_df$tf_lbl)), scales='free_y') +
-  labs(title='Barcode counts for all TFs (sorted by LogFC*p_adj)', x='Replicate', y='Log2(cDNA/pDNA)') +
+  labs(
+    title = if (is.null(opt$model_activity)) 'Before comparison normalization' else 'After comparison normalization (BCalm input)',
+    subtitle = 'TFs ordered by result; significance and logFC are from the comparison model',
+    x = 'Replicate',
+    y = if (is.null(opt$model_activity)) 'log2(cDNA RPM / pDNA RPM)' else 'log2((cDNA + 1) / (pDNA + 1))'
+  ) +
   ggthemes::theme_few() +
   new_scale_color() +
   geom_violin(aes(fill=treatment_col, color=treatment_col), alpha=0.4, width=1) +

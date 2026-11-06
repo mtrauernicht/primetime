@@ -172,7 +172,14 @@ for (this_comparison in result_files) {
         next
     }
 
-    comparison_df <- suppressWarnings(read.table(this_comparison, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE))
+    # Comparisons without any replicate left (MIN_READS_PER_REPLICATE) have an empty result file
+    comparison_df <- tryCatch(
+        suppressWarnings(read.table(this_comparison, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)),
+        error = function(e) NULL
+    )
+    if (is.null(comparison_df)) {
+        next
+    }
 
     if (!all(c("tf", "logFC") %in% colnames(comparison_df))) {
         next

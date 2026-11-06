@@ -51,8 +51,9 @@ samples_file = config['SAMPLES_FILE']
 normalize_counts = "TRUE" if config.get("NORMALIZE_COUNTS", True) else "FALSE"
 banana_correction = "TRUE" if config.get("BANANA_CORRECTION", True) else "FALSE"
 banana_reference_n = int(config.get("BANANA_REFERENCE_N", 3))
-depth_normalization = "TRUE" if config.get("DEPTH_NORMALIZATION", False) else "FALSE"
-barcode_offset_correction = "TRUE" if config.get("BARCODE_OFFSET_CORRECTION", False) else "FALSE"
+min_reads_per_replicate = int(config.get("MIN_READS_PER_REPLICATE", 0))
+max_bleedthrough = float(config.get("MAX_BLEEDTHROUGH", 0.5))
+shrinkage = "TRUE" if config.get("SHRINKAGE", False) else "FALSE"
 
 
 # Goodbye message
@@ -116,8 +117,12 @@ def create_goodbye_message(sample_replicate_files, comparisons_dict):
 # Parse the samples and replicates on the samples_file
 sample_replicate_files = {}
 with open(samples_file, "r") as f:
-    for line in f:
+    for line_number, line in enumerate(f, start=1):
+        if not line.strip():
+            continue
         row = line.strip().split("\t")
+        if len(row) < 2:
+            raise ValueError(f"{samples_file}, line {line_number}: expected '<sample><TAB><fastq path>', got {line.strip()!r}")
         sample = row[0]
         fastq = row[1]
         if sample not in sample_replicate_files:
@@ -154,8 +159,7 @@ rule all:
         cDNA=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
         pDNA=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
         qc=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
-        depth_correlation=os.path.join(output_dir, "primetime_QC/cDNA_depth_correlations.pdf"),
-        barcode_offset_correlation=os.path.join(output_dir, "primetime_QC/barcode_offset_correction.pdf"),
+        raw_random_rpm=os.path.join(output_dir, "primetime_QC/raw_random_reporter_rpm.pdf"),
         bleedthrough_all=os.path.join(output_dir, "primetime_QC/bleedthrough_estimation_all_reporters.pdf"),
         heatmap_comparisons=os.path.join(output_dir, "primetime_results/heatmap_comparisons.pdf"),
         umap_plot=os.path.join(output_dir, "primetime_results/umap_conditions.pdf"),
@@ -164,6 +168,9 @@ rule all:
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
         ],
+        shrinkage_qc=[os.path.join(output_dir, "primetime_QC/shrinkage_effect.pdf")] if shrinkage == "TRUE" else [],
+        count_level_normalization_qc=[os.path.join(output_dir, "primetime_QC/count_level_normalization.pdf")] if normalize_counts == "TRUE" else [],
+        banana_qc=[os.path.join(output_dir, "primetime_QC/banana_correction.pdf")] if banana_correction == "TRUE" else [],
         all_volcanos=[
             os.path.join(output_dir, f"primetime_results/volcano_plots/{contrast}_vs_{ref}.pdf")
             for ref, contrasts in comparisons_dict.items()
@@ -175,9 +182,10 @@ rule all:
             for contrast in contrasts
         ],
         all_top_tf_plots=[
-            os.path.join(output_dir, f"primetime_results/top_tf_barcode_counts/{contrast}_vs_{ref}.pdf")
+            os.path.join(output_dir, f"primetime_results/top_tf_barcode_counts/{stage}/{contrast}_vs_{ref}.pdf")
             for ref, contrasts in comparisons_dict.items()
             for contrast in contrasts
+            for stage in ("before_normalization", "after_normalization")
         ]
     message:
         create_goodbye_message(sample_replicate_files, comparisons_dict)
@@ -289,7 +297,7 @@ rule annotate_barcodes:
 --stats {input.stats} \
 --amount_spikes {params.amount_spikes} \
 --bc_annotation {params.bc_annotation} \
---sample {wildcards.sample} \
+--sample={wildcards.sample:q} \
 --replicate_number {wildcards.replicate} \
 --output {output}
         """
@@ -298,7 +306,8 @@ rule annotate_barcodes:
 
 rule get_activity_and_qc_plots:
     input:
-        dfs=path_to_annotated_dfs
+        dfs=path_to_annotated_dfs,
+        comparisons=comparisons_file,
     output:
         bc_corr=os.path.join(output_dir, "primetime_QC/barcode_correlations.pdf"),
         replicate_corr=os.path.join(
@@ -309,8 +318,7 @@ rule get_activity_and_qc_plots:
         ),
         read_counts=os.path.join(output_dir, "primetime_QC/read_counts.pdf"),
         bc_counts=os.path.join(output_dir, "primetime_QC/distribution_of_BC_counts.pdf"),
-        depth_correlation=os.path.join(output_dir, "primetime_QC/cDNA_depth_correlations.pdf"),
-        barcode_offset_correlation=os.path.join(output_dir, "primetime_QC/barcode_offset_correction.pdf"),
+        raw_random_rpm=os.path.join(output_dir, "primetime_QC/raw_random_reporter_rpm.pdf"),
         control_bc_corr=os.path.join(output_dir, "primetime_QC/control_barcode_correlations.pdf"),
         bleedthrough=os.path.join(
             output_dir, "primetime_QC/bleedthrough_estimation.pdf"
@@ -325,6 +333,8 @@ rule get_activity_and_qc_plots:
         bleedthrough_all_data=os.path.join(output_dir, "tmp_primetime/activity/bleedthrough_all_reporters_per_condition.txt"),
         banana_reference_samples=os.path.join(output_dir, "tmp_primetime/activity/banana_reference_samples.tsv"),
         read_count_summary=os.path.join(output_dir, "tmp_primetime/activity/read_count_per_sample.tsv"),
+        bleedthrough_filter_estimates=os.path.join(output_dir, "tmp_primetime/activity/bleedthrough_filter_estimates.tsv"),
+        excluded_high_bleedthrough=os.path.join(output_dir, "tmp_primetime/activity/excluded_high_bleedthrough_replicates.tsv"),
     params:
         script=os.path.join(scripts_dir, "primetime_get_activity_and_qc_plots.R"),
         df_basedir=os.path.join(output_dir, "tmp_primetime/bc_counts"),
@@ -333,9 +343,9 @@ rule get_activity_and_qc_plots:
         activity_basedir=os.path.join(output_dir, "tmp_primetime/activity"),
         barcode_activity_output=os.path.join(output_dir, "tmp_primetime/activity/barcode_activity.txt"),
         banana_correction=banana_correction,
-        depth_normalization=depth_normalization,
-        barcode_offset_correction=barcode_offset_correction,
         banana_reference_n=banana_reference_n,
+        min_reads_per_replicate=min_reads_per_replicate,
+        max_bleedthrough=max_bleedthrough,
     conda:
         os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
@@ -344,17 +354,19 @@ rule get_activity_and_qc_plots:
         mkdir -p {params.activity_basedir}
 
         Rscript {params.script} \
-        --list_of_annotated_files "{input}" \
+        --list_of_annotated_files "{input.dfs}" \
         --design {samples_file} \
         --plots_basedir {params.plots_basedir} \
         --activity_basedir {params.activity_basedir} \
         --expected_pdna {params.expected_pdna_counts} \
         --cdna_output {output.cDNA} \
         --barcode_activity_output {params.barcode_activity_output} \
+        --comparisons {input.comparisons:q} \
         --banana_correction {params.banana_correction} \
-        --depth_normalization {params.depth_normalization} \
-        --barcode_offset_correction {params.barcode_offset_correction} \
-        --banana_reference_n {params.banana_reference_n}
+        --banana_reference_n {params.banana_reference_n} \
+        --min_reads_per_replicate {params.min_reads_per_replicate} \
+        --max_bleedthrough {params.max_bleedthrough} \
+        --skip_correction_plots TRUE
         """
 
 rule run_comparative_analysis:
@@ -365,6 +377,8 @@ rule run_comparative_analysis:
     output:
         txt=os.path.join(output_dir, "primetime_results/output_data/{contrast}_vs_{ref}.txt"),
         plots=os.path.join(output_dir, "primetime_results/volcano_plots/{contrast}_vs_{ref}.pdf"),
+        banana_qc=os.path.join(output_dir, "tmp_primetime/activity/banana_qc/{contrast}_vs_{ref}.tsv"),
+        model_activity=os.path.join(output_dir, "tmp_primetime/activity/model_barcode_activity/{contrast}_vs_{ref}.tsv"),
         loli=os.path.join(output_dir, "primetime_results/lollipop_plots/{contrast}_vs_{ref}.pdf"),
         circular_loli=os.path.join(output_dir, "primetime_results/circular_lollipop_plots/{contrast}_vs_{ref}.pdf"),
     params:
@@ -377,6 +391,7 @@ rule run_comparative_analysis:
         reference_condition=lambda wildcards: wildcards.ref,
         num_replicates_reference=lambda wildcards: len(sample_replicate_files[wildcards.ref]),
         normalize=normalize_counts,
+        shrinkage=shrinkage,
         banana_correction=banana_correction
     conda:
         os.path.join(conda_envs_dir, "comparative_analysis.yaml")
@@ -394,8 +409,63 @@ rule run_comparative_analysis:
         --num_replicates_reference {params.num_replicates_reference} \
         --plot_output {params.plot_output_dir} \
         --normalize {params.normalize} \
+        --shrinkage {params.shrinkage} \
         --banana_correction {params.banana_correction} \
         --banana_reference_file {input.banana_reference}
+        """
+
+##########################################################################################
+
+rule get_banana_qc:
+    input:
+        data=[
+            os.path.join(output_dir, f"tmp_primetime/activity/banana_qc/{contrast}_vs_{ref}.tsv")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        ],
+    output:
+        os.path.join(output_dir, "primetime_QC/banana_correction.pdf"),
+    params:
+        r_script=os.path.join(scripts_dir, "primetime_get_banana_qc.R"),
+    shell:
+        """
+        FILELIST=$(mktemp)
+        printf '%s\\n' {input.data} > "$FILELIST"
+        Rscript {params.r_script} --input-file "$FILELIST" --output {output}
+        rm "$FILELIST"
+        """
+
+rule get_count_level_qc:
+    input:
+        cdna=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
+        pdna=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
+        read_count_summary=os.path.join(output_dir, "tmp_primetime/activity/read_count_per_sample.tsv"),
+    output:
+        os.path.join(output_dir, "primetime_QC/count_level_normalization.pdf"),
+    params:
+        r_script=os.path.join(scripts_dir, "primetime_get_count_level_qc.R"),
+    shell:
+        """
+        Rscript {params.r_script} --cdna {input.cdna} --pdna {input.pdna} --read_count_summary {input.read_count_summary} --output {output}
+        """
+
+rule get_shrinkage_qc:
+    input:
+        results=expand(
+            os.path.join(output_dir, f"primetime_results/output_data/{contrast}_vs_{ref}.txt")
+            for ref, contrasts in comparisons_dict.items()
+            for contrast in contrasts
+        )
+    output:
+        os.path.join(output_dir, "primetime_QC/shrinkage_effect.pdf"),
+    params:
+        r_script=os.path.join(scripts_dir, "screen", "primetime_get_shrinkage_qc.R"),
+    shell:
+        """
+        FILELIST=$(mktemp)
+        for f in {input.results}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
+        Rscript {params.r_script} --results-file "$FILELIST" --output {output}
+        rm "$FILELIST"
         """
 
 ##########################################################################################
@@ -405,8 +475,10 @@ rule get_bc_counts_for_top_tfs:
         result=os.path.join(output_dir, "primetime_results/output_data/{contrast}_vs_{ref}.txt"),
         cdna=os.path.join(output_dir, "tmp_primetime/activity/cDNA_counts.txt"),
         pdna=os.path.join(output_dir, "tmp_primetime/activity/pDNA_counts.txt"),
+        model_activity=os.path.join(output_dir, "tmp_primetime/activity/model_barcode_activity/{contrast}_vs_{ref}.tsv"),
     output:
-        plot=os.path.join(output_dir, "primetime_results/top_tf_barcode_counts/{contrast}_vs_{ref}.pdf"),
+        before=os.path.join(output_dir, "primetime_results/top_tf_barcode_counts/before_normalization/{contrast}_vs_{ref}.pdf"),
+        after=os.path.join(output_dir, "primetime_results/top_tf_barcode_counts/after_normalization/{contrast}_vs_{ref}.pdf"),
         design=temp(os.path.join(output_dir, "tmp_primetime/activity/design/{contrast}_vs_{ref}.txt")),
     params:
         script=os.path.join(scripts_dir, "primetime_get_bc_counts_for_top_tfs.R"),
@@ -418,7 +490,7 @@ rule get_bc_counts_for_top_tfs:
         os.path.join(conda_envs_dir, "r_plotting.yaml")
     shell:
         """
-        mkdir -p $(dirname {output.plot})
+        mkdir -p $(dirname {output.before}) $(dirname {output.after})
         mkdir -p $(dirname {output.design})
 
         echo -e "replicate\ttreatment\tsample\tpDNA" > {output.design}
@@ -433,7 +505,16 @@ rule get_bc_counts_for_top_tfs:
         --result {input.result} \
         --cdna {input.cdna} \
         --pdna {input.pdna} \
-        --output {output.plot} \
+        --output {output.before} \
+        --design {output.design} \
+        --reference_condition {params.reference_condition}
+
+        Rscript {params.script} \
+        --result {input.result} \
+        --cdna {input.cdna} \
+        --pdna {input.pdna} \
+        --model_activity {input.model_activity} \
+        --output {output.after} \
         --design {output.design} \
         --reference_condition {params.reference_condition}
         """

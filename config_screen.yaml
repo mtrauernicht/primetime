@@ -17,7 +17,7 @@
 ## Example PLATES_FILE row: U2OS<TAB>/path/to/U2OS_R2.fastq.gz<TAB>/path/to/U2OS_samples.csv
 PLATES_FILE: /DATA/pipelines/primetime/testing_E2904/mt20260112_plates_to_file.txt
 DEMULTIPLEX_DIRECTORY: /shared/gcf/m.trauernicht/shared/h.yucel/8507/NOVA441_fastq_files/demultiplex
-## Which comparisons should be performed?
+## Which comparisons should be performed? (ref_condition<TAB>test_condition1<TAB>test_condition2...)
 COMPARISONS_FILE: /DATA/pipelines/primetime/testing_E2904/mt20260112_comparisons.txt
 ## Where should the output be saved?
 OUTPUT_DIRECTORY: /DATA/pipelines/primetime/testing_E2904/001_OUTPUT_screen_testing
@@ -26,42 +26,49 @@ OUTPUT_DIRECTORY: /DATA/pipelines/primetime/testing_E2904/001_OUTPUT_screen_test
 # ============================ Pipeline parameters =============================
 PVALUE_THRESHOLD: 0.01
 
-SPLIT_COMPARATIVE_ANALYSIS_BY_PROMOTER: False
-
+# should the counts be normalized to the random controls to account for differences in baseline activity
 NORMALIZE_COUNTS: True
-RANDOM_NORM_METHOD: median
+# Normalization is count-level: counts are scaled per promoter and replicate using the RANDOM reporters before BCalm
 
-# Set to False to skip the banana-shaped bias correction of contrast vs reference barcode counts
+# banana-shaped bias correction of contrast vs reference barcode counts (to get rid of pDNA bleedthrough)
 BANANA_CORRECTION: True
-# Number of control (DMSO) replicates with the lowest pDNA bleed-through used as banana-correction reference
-# (all other samples, including remaining DMSO ones, are corrected against their mean). Use 0 for all controls.
+# Banana correction is done per comparison: the number of replicates of the reference condition with the
+# lowest pDNA bleed-through used as anchor (the others and the contrast are corrected against their mean).
+# Use 0 for all replicates of the reference condition.
 BANANA_REFERENCE_N: 3
 
-# Set to True to correct TF cDNA counts for sequencing-depth-dependent activity
-DEPTH_NORMALIZATION: False
+# correct cDNA counts for sequencing-depth-dependent biases (separately per TF)
+DEPTH_NORMALIZATION: True
 
-# Set to True to correct stable barcode-specific activity offsets per TF/promoter reporter
-BARCODE_OFFSET_CORRECTION: False
+# correct barcode-specific offsets to sample median
+BARCODE_OFFSET_CORRECTION: True
 
-# Set to True to also report empirical-Bayes shrunken logFC (after BCalm; p-values stay unshrunk)
-SHRINKAGE: False
+# Exclude cDNA replicates with fewer than this many reads (0 = keep all). Comparisons that lose all
+# replicates of a condition get empty outputs.
+MIN_READS_PER_REPLICATE: 0
+
+# Exclude cDNA replicates above this pre-barcode-filter bleed-through fraction (0.5 = 50%); -1 disables.
+MAX_BLEEDTHROUGH: 0.5
+
+# report empirical-Bayes shrunken logFC (after BCalm; p-values stay unshrunk)
+SHRINKAGE: True
 
 # Set to False to skip demultiplexing and reuse existing demultiplexed FASTQ files
 # from DEMULTIPLEX_DIRECTORY.
 RUN_DEMULTIPLEXING: True
 
-# Optional: point to a previous run output directory (or directly to its tmp_primetime
-# directory) to reuse RT barcode clustering files and skip re-running
-# extract_rt_barcodes/cluster_rt_barcodes.
-# Examples:
-# PREVIOUS_TMP_PRIMETIME_DIR: /path/to/old_run_output
-# PREVIOUS_TMP_PRIMETIME_DIR: /path/to/old_run_output/tmp_primetime
-PREVIOUS_TMP_PRIMETIME_DIR: ""
 
 # Optional: when True, read annotated barcode files directly from
 # PREVIOUS_TMP_PRIMETIME_DIR/tmp_primetime/bc_counts and skip recomputing
 # get_barcode_counts/cluster_barcodes/annotate_barcodes.
 REUSE_PREVIOUS_BC_COUNTS: False
+
+# If true, set directory, Examples:
+# PREVIOUS_TMP_PRIMETIME_DIR: /path/to/old_run_output
+# PREVIOUS_TMP_PRIMETIME_DIR: /path/to/old_run_output/tmp_primetime
+PREVIOUS_TMP_PRIMETIME_DIR: ""
+
+
 
 # ==============================================================================
 # ============================ Library parameters ==============================
