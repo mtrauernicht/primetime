@@ -351,7 +351,7 @@ banana_replicate_ma_df <- function(cdna_matrix_before, cdna_matrix_after, pdna_m
 # Preparing the data #####################################################################
 ##########################################################################################
 
-pdna <- read.table(opt$pdna, header = TRUE, sep = "\t")
+pdna <- read.table(opt$pdna, header = TRUE, sep = "\t", quote = "", comment.char = "")
 name_of_the_pdna_replicate <- colnames(pdna) %>% setdiff(c("barcode", "negative_control"))
 
 contrast_condition <- opt$contrast_condition
@@ -373,12 +373,12 @@ contrast_replicates = paste0(contrast_condition, "_", 1:opt$num_replicates_contr
 banana_anchor_replicates <- character(0)
 if (banana_correction && !is.null(opt$banana_reference_file) && file.exists(opt$banana_reference_file)) {
         # Anchors are chosen per comparison: only the flagged replicates of this comparison's reference condition
-        banana_reference_df <- read.table(opt$banana_reference_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+        banana_reference_df <- read.table(opt$banana_reference_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE, quote = "", comment.char = "")
         banana_anchor_replicates <- as.character(banana_reference_df$replicate[banana_reference_df$used_as_reference & banana_reference_df$replicate %in% ref_replicates])
 }
 extra_anchor_replicates <- character(0)
 extra_anchor_replicates <- setdiff(banana_anchor_replicates, c(ref_replicates, contrast_replicates))
-cdna_all <- read.table(opt$cdna, header = TRUE, sep = "\t", check.names = FALSE)
+cdna_all <- read.table(opt$cdna, header = TRUE, sep = "\t", check.names = FALSE, quote = "", comment.char = "")
 extra_anchor_replicates <- intersect(extra_anchor_replicates, colnames(cdna_all))
 
 # Replicates removed upstream (MIN_READS_PER_REPLICATE) are no longer in the count tables.
@@ -670,12 +670,19 @@ BcVariantMPRASet <- MPRASet(
 # Preparing the design_bcalm data, where each row is a sample (same order as the matrix)
 # and we have whether it is the contrast condition
 ordered_annotation = annotation_df[colnames(this_pdna_matrix), ]
+if (is.na(contrast_condition) || is.na(reference_condition) ||
+    contrast_condition == reference_condition ||
+    anyNA(ordered_annotation$treatment) ||
+    !all(ordered_annotation$treatment %in% c(reference_condition, contrast_condition)) ||
+    !all(c(reference_condition, contrast_condition) %in% ordered_annotation$treatment)) {
+        stop("Invalid BCalm design: both distinct reference and contrast conditions must have annotated observations")
+}
 
 # Now create the design data
 design_bcalm =
         data.frame(
                 intcpt = 1,
-                grepl(contrast_condition, ordered_annotation$treatment)
+                ordered_annotation$treatment == contrast_condition
         )
 
 colnames(design_bcalm) = c("intcpt", contrast_condition)

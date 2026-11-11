@@ -1,0 +1,2 @@
+pDNA	fastq/pDNA.fastq.gz
+K562_TEST	fastq/K562_TEST_raw_R1.fastq.gz	well_specification.csv

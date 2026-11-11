@@ -785,24 +785,24 @@ rule run_comparative_analysis:
     threads: 1
     shell:
         """
-        {RSCRIPT} {params.script} \
-        --cdna {input.cDNA} \
-        --cdna_baseline {input.cDNA_baseline} \
-        --pdna {input.pDNA} \
-        --output {params.out_basedir} \
+        {RSCRIPT:q} {params.script:q} \
+        --cdna {input.cDNA:q} \
+        --cdna_baseline {input.cDNA_baseline:q} \
+        --pdna {input.pDNA:q} \
+        --output {params.out_basedir:q} \
         --pval_threshold {params.pval_threshold} \
-        --contrast_condition {params.contrast_condition} \
-        --contrast_replicates {params.contrast_replicates} \
+        --contrast_condition={params.contrast_condition:q} \
+        --contrast_replicates={params.contrast_replicates:q} \
         --num_replicates_contrast {params.num_replicates_contrast} \
-        --reference_condition {params.reference_condition} \
-        --reference_replicates {params.reference_replicates} \
+        --reference_condition={params.reference_condition:q} \
+        --reference_replicates={params.reference_replicates:q} \
         --num_replicates_reference {params.num_replicates_reference} \
-        --plot_output {params.plot_output_dir} \
+        --plot_output {params.plot_output_dir:q} \
         --normalize {params.normalize} \
         --shrinkage {params.shrinkage} \
         --banana_correction {params.banana_correction} \
-        --plate_ids {params.plate_ids} \
-        --banana_reference_file {input.banana_reference}
+        --plate_ids={params.plate_ids:q} \
+        --banana_reference_file {input.banana_reference:q}
         """
 
 ##########################################################################################
@@ -907,7 +907,7 @@ rule get_heatmap_of_conditions:
     shell:
         """
         FILELIST=$(mktemp)
-        for f in {input.results}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
+        for f in {input.results:q}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
 
         sample_info_args=()
         if [[ -n "{params.sample_info}" ]]; then
@@ -940,7 +940,7 @@ rule get_banana_qc:
     shell:
         """
         FILELIST=$(mktemp)
-        printf '%s\\n' {input.data} > "$FILELIST"
+        printf '%s\\n' {input.data:q} > "$FILELIST"
         {RSCRIPT} {params.r_script} --input-file "$FILELIST" --output {output}
         rm "$FILELIST"
         """
@@ -973,7 +973,7 @@ rule get_shrinkage_qc:
     shell:
         """
         FILELIST=$(mktemp)
-        for f in {input.results}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
+        for f in {input.results:q}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
         {RSCRIPT} {params.r_script} --results-file "$FILELIST" --output {output}
         rm "$FILELIST"
         """
@@ -994,7 +994,7 @@ rule get_pca_plot:
     shell:
         """
         FILELIST=$(mktemp)
-        for f in {input.results}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
+        for f in {input.results:q}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
         {RSCRIPT} {params.r_script} --results-file "$FILELIST" --output {output}
         rm "$FILELIST"
         """
@@ -1022,9 +1022,9 @@ rule get_tf_specific_plots:
         mkdir -p {output}
         
         FILELIST=$(mktemp)
-        for f in {input.results}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
+        for f in {input.results:q}; do [[ $(wc -l < "$f") -gt 1 ]] && echo "$f"; done > "$FILELIST" || true
         
-        BARCODE_DIR=$(dirname {input.barcodes[0]})
+        BARCODE_DIR=$(dirname {input.barcodes[0]:q})
         
         {RSCRIPT} {params.r_script} \
             --results-file "$FILELIST" \

@@ -192,6 +192,8 @@ left and the same bias is not corrected twice. The result is independent of the 
 
 `MIN_READS_PER_REPLICATE` (default `0`, i.e. off) excludes cDNA replicates with fewer reads than this value from all downstream analysis. `MAX_BLEEDTHROUGH` (default `0.5`, i.e. 50%; set `-1` to disable) excludes cDNA replicates whose estimated bleed-through slope is strictly greater than the cutoff. The slope is the linear fit of negative-control cDNA RPM against mean pDNA RPM, with an intercept, after the read-count filter but before barcode filtering or corrections. An unestimable slope stops the run. `tmp_primetime/activity/bleedthrough_filter_estimates.tsv` records all tested replicates and decisions; `excluded_high_bleedthrough_replicates.tsv` lists the exclusions. The later bleed-through diagnostic is fitted after barcode filtering and may differ from the filter estimate. Comparisons that lose every replicate of one side are written with empty outputs; if all cDNA replicates are excluded, the QC step stops with an error.
 
+The bleed-through fit uses the pipeline's RPM convention, which adds one pseudocount per annotated barcode before calculating each library total. The cutoff is active by default, including for existing configs that do not specify it; set `MAX_BLEEDTHROUGH: -1` to retain the previous behavior.
+
 ## Optional: Changing the library information
 
 There are some additional parameters on the config file related to the barcodes used in the analysis

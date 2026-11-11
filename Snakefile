@@ -398,20 +398,20 @@ rule run_comparative_analysis:
     threads: 1
     shell:
         """
-        Rscript {params.script} \
-        --cdna {input.cDNA} \
-        --pdna {input.pDNA} \
-        --output {params.out_basedir} \
+        Rscript {params.script:q} \
+        --cdna {input.cDNA:q} \
+        --pdna {input.pDNA:q} \
+        --output {params.out_basedir:q} \
         --pval_threshold {params.pval_threshold} \
-        --contrast_condition {params.contrast_condition} \
+        --contrast_condition={params.contrast_condition:q} \
         --num_replicates_contrast {params.num_replicates_contrast} \
-        --reference_condition {params.reference_condition} \
+        --reference_condition={params.reference_condition:q} \
         --num_replicates_reference {params.num_replicates_reference} \
-        --plot_output {params.plot_output_dir} \
+        --plot_output {params.plot_output_dir:q} \
         --normalize {params.normalize} \
         --shrinkage {params.shrinkage} \
         --banana_correction {params.banana_correction} \
-        --banana_reference_file {input.banana_reference}
+        --banana_reference_file {input.banana_reference:q}
         """
 
 ##########################################################################################

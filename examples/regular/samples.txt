@@ -1,0 +1,13 @@
+WT_unactivated	fastq/S31_WT_unactivated.fastq.gz
+WT_unactivated	fastq/S16_WT_unactivated.fastq.gz
+WT_aCD3_aCD28	fastq/S17_WT_aCD3_aCD28.fastq.gz
+WT_PMA_Ionomycin	fastq/S18_WT_PMA_Ionomycin.fastq.gz
+KO_unactivated	fastq/S19_KO_unactivated.fastq.gz
+KO_aCD3_aCD28	fastq/S20_KO_aCD3_aCD28.fastq.gz
+KO_PMA_Ionomycin	fastq/S21_KO_PMA_Ionomycin.fastq.gz
+WT_aCD3_aCD28	fastq/S32_WT_aCD3_aCD28.fastq.gz
+WT_PMA_Ionomycin	fastq/S33_WT_PMA_Ionomycin.fastq.gz
+KO_unactivated	fastq/S34_KO_unactivated.fastq.gz
+KO_aCD3_aCD28	fastq/S35_KO_aCD3_aCD28.fastq.gz
+KO_PMA_Ionomycin	fastq/S36_KO_PMA_Ionomycin.fastq.gz
+pDNA	fastq/pDNA.fastq.gz

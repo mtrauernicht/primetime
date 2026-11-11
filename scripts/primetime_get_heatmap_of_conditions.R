@@ -111,7 +111,7 @@ if (nzchar(trimws(sample_info_path)) && file.exists(sample_info_path) && file.in
                     target_value = if (!is.na(target_col) && target_col %in% colnames(.)) trimws(as.character(.data[[target_col]])) else NA_character_,
                     sample_target = ifelse(
                         !is.na(target_value) & nzchar(target_value),
-                        paste0(sample_name, "_", target_value),
+                        paste0(sample_name, " -> ", target_value),
                         sample_name
                     ),
                     sample_class = if (!is.na(class_col) && class_col %in% colnames(.)) trimws(as.character(.data[[class_col]])) else NA_character_
@@ -174,7 +174,7 @@ for (this_comparison in result_files) {
 
     # Comparisons without any replicate left (MIN_READS_PER_REPLICATE) have an empty result file
     comparison_df <- tryCatch(
-        suppressWarnings(read.table(this_comparison, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)),
+        suppressWarnings(read.table(this_comparison, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE, quote = "", comment.char = "")),
         error = function(e) NULL
     )
     if (is.null(comparison_df)) {
@@ -431,6 +431,10 @@ annotation_colors <- list(
     read_count = colorRampPalette(c("#1680a9", "#ffffff"))(100)
 )
 
+heatmap_cell_width <- 6
+heatmap_cell_height <- 6
+heatmap_label_fontsize <- 6
+
 plot_no_rows_page <- function(label_text) {
     plot.new()
     text(0.5, 0.5, label_text)
@@ -471,21 +475,21 @@ plot_filtered_heatmap <- function(matrix_source, annotation_source, keep_rows, t
     }
 
     pheatmap(
-        matrix_sub,
-        cluster_rows = row_cluster_sub,
-        cluster_cols = col_cluster_sub,
-        annotation_row = annotation_sub,
+        t(matrix_sub),
+        cluster_rows = col_cluster_sub,
+        cluster_cols = row_cluster_sub,
+        annotation_col = annotation_sub,
         annotation_colors = annotation_colors,
         border_color = NA,
         color = colorRampPalette(c("#6495ed", "white", "#f37f80"))(100),
         breaks = seq(break_limits[1], break_limits[2], length.out = 101),
         na_col = "#eeedf1",
         main = title_text,
-        cellwidth = 6,
-        cellheight = 6,
-        fontsize_row = 6,
-        fontsize_col = 6,
-        angle_col = 90
+        cellwidth = heatmap_cell_width,
+        cellheight = heatmap_cell_height,
+        fontsize_row = heatmap_label_fontsize,
+        fontsize_col = heatmap_label_fontsize,
+        angle_col = "270"
     )
 }
 
@@ -499,10 +503,17 @@ if (ncol(matrix_values) >= 2) {
     col_cluster <- hclust(dist(t(matrix_values)), method = "ward.D2")
 }
 
+pdf(NULL)
+par(ps = heatmap_label_fontsize)
+label_width <- max(strwidth(heatmap_wide$sample_label, units = "inches"))
+tf_label_width <- max(strwidth(colnames(matrix_values), units = "inches"))
+par(ps = 10)
+class_label_width <- max(strwidth(sample_class_levels, units = "inches"))
+invisible(dev.off())
 pdf(
     opt$output,
-    width = max(10, min(40, 4 + 0.16 * ncol(matrix_values))),
-    height = max(6, min(30, 3 + 0.45 * nrow(matrix_values)))
+    width = max(10, 4 + nrow(heatmap_wide) * heatmap_cell_width / 72 + tf_label_width + class_label_width),
+    height = max(6, 3 + (ncol(heatmap_wide) - 1) * heatmap_cell_height / 72 + label_width)
 )
 
 if (has_shrunk_values) {
@@ -511,39 +522,39 @@ if (has_shrunk_values) {
     matrix_unshrunk <- matrix_unshrunk[rownames(matrix_values), colnames(matrix_values), drop = FALSE]
     matrix_unshrunk[is.na(matrix_unshrunk)] <- 0
     pheatmap(
-        matrix_unshrunk,
-        cluster_rows = if (nrow(matrix_unshrunk) >= 2) hclust(dist(matrix_unshrunk), method = "ward.D2") else FALSE,
-        cluster_cols = if (ncol(matrix_unshrunk) >= 2) hclust(dist(t(matrix_unshrunk)), method = "ward.D2") else FALSE,
-        annotation_row = row_annotation_df,
+        t(matrix_unshrunk),
+        cluster_rows = if (ncol(matrix_unshrunk) >= 2) hclust(dist(t(matrix_unshrunk)), method = "ward.D2") else FALSE,
+        cluster_cols = if (nrow(matrix_unshrunk) >= 2) hclust(dist(matrix_unshrunk), method = "ward.D2") else FALSE,
+        annotation_col = row_annotation_df,
         annotation_colors = annotation_colors,
         border_color = NA,
         color = colorRampPalette(c("#6495ed", "white", "#f37f80"))(100),
         breaks = seq(-2, 2, length.out = 101),
         main = "TF Fold-Change Heatmap Across Conditions (All Values, UNSHRUNK)",
-        cellwidth = 6,
-        cellheight = 6,
-        fontsize_row = 6,
-        fontsize_col = 6,
-        angle_col = 90
+        cellwidth = heatmap_cell_width,
+        cellheight = heatmap_cell_height,
+        fontsize_row = heatmap_label_fontsize,
+        fontsize_col = heatmap_label_fontsize,
+        angle_col = "270"
     )
 }
 
 # Heatmap 1: full fold-change heatmap across all conditions (all values, none masked).
 pheatmap(
-    matrix_values,
-    cluster_rows = row_cluster,
-    cluster_cols = col_cluster,
-    annotation_row = row_annotation_df,
+    t(matrix_values),
+    cluster_rows = col_cluster,
+    cluster_cols = row_cluster,
+    annotation_col = row_annotation_df,
     annotation_colors = annotation_colors,
     border_color = NA,
     color = colorRampPalette(c("#6495ed", "white", "#f37f80"))(100),
     breaks = seq(-2, 2, length.out = 101),
     main = paste0("TF Fold-Change Heatmap Across Conditions (All Values", if (has_shrunk_values) ", SHRUNK" else "", ")"),
-    cellwidth = 6,
-    cellheight = 6,
-    fontsize_row = 6,
-    fontsize_col = 6,
-    angle_col = 90
+    cellwidth = heatmap_cell_width,
+    cellheight = heatmap_cell_height,
+    fontsize_row = heatmap_label_fontsize,
+    fontsize_col = heatmap_label_fontsize,
+    angle_col = "270"
 )
 
 # Heatmap 2: use all rows and median-center per TF.
@@ -569,20 +580,20 @@ if (length(rows_keep_center) == 0) {
     }
 
     pheatmap(
-        matrix_values_centered,
-        cluster_rows = row_cluster_centered,
-        cluster_cols = col_cluster_centered,
-        annotation_row = annotation_centered,
+        t(matrix_values_centered),
+        cluster_rows = col_cluster_centered,
+        cluster_cols = row_cluster_centered,
+        annotation_col = annotation_centered,
         annotation_colors = annotation_colors,
         border_color = NA,
         color = colorRampPalette(c("#6495ed", "white", "#f37f80"))(100),
         breaks = seq(-centered_limit, centered_limit, length.out = 101),
         main = "TF Fold-Change Heatmap (Median-centered per TF)",
-        cellwidth = 6,
-        cellheight = 6,
-        fontsize_row = 6,
-        fontsize_col = 6,
-        angle_col = 90
+        cellwidth = heatmap_cell_width,
+        cellheight = heatmap_cell_height,
+        fontsize_row = heatmap_label_fontsize,
+        fontsize_col = heatmap_label_fontsize,
+        angle_col = "270"
     )
 }
 
@@ -647,21 +658,21 @@ if (!is.null(score_matrix) && nrow(score_matrix) > 0 && ncol(score_matrix) > 0) 
     score_row_cluster <- if (nrow(score_matrix) >= 2) hclust(dist(score_matrix), method = "ward.D2") else FALSE
     score_col_cluster <- if (ncol(score_matrix) >= 2) hclust(dist(t(score_matrix)), method = "ward.D2") else FALSE
     pheatmap(
-        score_matrix,
-        cluster_rows = score_row_cluster,
-        cluster_cols = score_col_cluster,
-        annotation_row = score_annotation,
+        t(score_matrix),
+        cluster_rows = score_col_cluster,
+        cluster_cols = score_row_cluster,
+        annotation_col = score_annotation,
         annotation_colors = annotation_colors,
         border_color = NA,
         color = colorRampPalette(c("#6495ed", "white", "#f37f80"))(100),
         breaks = seq(-4, 4, length.out = 101),
         na_col = "#eeedf1",
         main = "TF Signed Score Heatmap Across Conditions (logFC * -log10(p-value))",
-        cellwidth = 6,
-        cellheight = 6,
-        fontsize_row = 6,
-        fontsize_col = 6,
-        angle_col = 90
+        cellwidth = heatmap_cell_width,
+        cellheight = heatmap_cell_height,
+        fontsize_row = heatmap_label_fontsize,
+        fontsize_col = heatmap_label_fontsize,
+        angle_col = "270"
     )
 } else {
     plot.new()
@@ -679,21 +690,21 @@ if (!is.null(score_matrix) && nrow(score_matrix) > 0 && ncol(score_matrix) > 0) 
     score_row_cluster <- if (nrow(score_matrix) >= 2) hclust(dist(score_matrix), method = "ward.D2") else FALSE
     score_col_cluster <- if (ncol(score_matrix) >= 2) hclust(dist(t(score_matrix)), method = "ward.D2") else FALSE
     pheatmap(
-        score_matrix,
-        cluster_rows = score_row_cluster,
-        cluster_cols = score_col_cluster,
-        annotation_row = score_annotation,
+        t(score_matrix),
+        cluster_rows = score_col_cluster,
+        cluster_cols = score_row_cluster,
+        annotation_col = score_annotation,
         annotation_colors = annotation_colors,
         border_color = NA,
         color = colorRampPalette(c("#6495ed", "white", "#f37f80"))(100),
         breaks = seq(-4, 4, length.out = 101),
         na_col = "#eeedf1",
         main = "TF Signed Score Heatmap Across Conditions (logFC * -log10(p-value)), |score| >= 1",
-        cellwidth = 6,
-        cellheight = 6,
-        fontsize_row = 6,
-        fontsize_col = 6,
-        angle_col = 90
+        cellwidth = heatmap_cell_width,
+        cellheight = heatmap_cell_height,
+        fontsize_row = heatmap_label_fontsize,
+        fontsize_col = heatmap_label_fontsize,
+        angle_col = "270"
     )
 } else {
     plot.new()

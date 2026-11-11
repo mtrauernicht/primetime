@@ -171,7 +171,7 @@ cdna_path <- find_existing_path(c(
 if (!is.na(cdna_path) && file.exists(cdna_path)) {
     message("Loading cDNA counts file from: ", cdna_path)
     cdna_df <- tryCatch({
-        read.table(cdna_path, header = TRUE, stringsAsFactors = FALSE)
+        read.table(cdna_path, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE, quote = "", comment.char = "")
     }, error = function(e) {
         warning("Failed to read cDNA counts: ", e$message)
         NULL
@@ -187,7 +187,7 @@ pDNA_path <- find_existing_path(c(
 if (!is.na(pDNA_path) && file.exists(pDNA_path)) {
     message("Loading pDNA counts file from: ", pDNA_path)
     pDNA_df <- tryCatch({
-        read.table(pDNA_path, header = TRUE, stringsAsFactors = FALSE)
+        read.table(pDNA_path, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE, quote = "", comment.char = "")
     }, error = function(e) {
         warning("Failed to read pDNA counts: ", e$message)
         NULL
@@ -210,7 +210,7 @@ barcode_activity_path <- if (
 if (!is.na(barcode_activity_path) && file.exists(barcode_activity_path)) {
     message("Loading barcode activity file from: ", barcode_activity_path)
     barcode_activity_df <- tryCatch({
-        read.table(barcode_activity_path, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+        read.table(barcode_activity_path, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE, quote = "", comment.char = "")
     }, error = function(e) {
         warning("Failed to read barcode activity file: ", e$message)
         NULL

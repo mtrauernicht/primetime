@@ -603,6 +603,21 @@ estimate_early_bleedthrough <- function(counts) {
     }))
 }
 
+apply_bleedthrough_cutoff <- function(counts, cutoff) {
+    if (length(cutoff) != 1 || !is.finite(cutoff) ||
+        (cutoff < 0 && cutoff != -1)) {
+        stop("--max_bleedthrough must be a non-negative finite fraction, or -1 to disable")
+    }
+    estimates <- if (cutoff == -1) {
+        data.frame(sample = character(), replicate = character(), slope = numeric(),
+                   intercept = numeric(), n_controls = integer())
+    } else {
+        estimate_early_bleedthrough(counts)
+    }
+    estimates$excluded <- estimates$slope > cutoff
+    estimates
+}
+
 raw_random_rpm <- function(data, count_col, neg_ctrl_col, sample, replicate) {
     counts <- as.numeric(data[[count_col]])
     if (any(!is.finite(counts)) || any(counts < 0)) {
@@ -850,17 +865,7 @@ if (isTRUE(opt$min_reads_per_replicate > 0)) {
     counts_df <- counts_df %>% filter(pDNA | !replicate %in% low_read_replicates$replicate)
 }
 
-if (length(opt$max_bleedthrough) != 1 || !is.finite(opt$max_bleedthrough) ||
-    (opt$max_bleedthrough < 0 && opt$max_bleedthrough != -1)) {
-    stop("--max_bleedthrough must be a non-negative finite fraction, or -1 to disable")
-}
-early_bleedthrough <- if (opt$max_bleedthrough == -1) {
-    data.frame(sample = character(), replicate = character(), slope = numeric(),
-               intercept = numeric(), n_controls = integer())
-} else {
-    estimate_early_bleedthrough(counts_df)
-}
-early_bleedthrough$excluded <- early_bleedthrough$slope > opt$max_bleedthrough
+early_bleedthrough <- apply_bleedthrough_cutoff(counts_df, opt$max_bleedthrough)
 write.table(
     early_bleedthrough,
     file = file.path(opt$activity_basedir, "bleedthrough_filter_estimates.tsv"),
